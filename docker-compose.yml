@@ -1,0 +1,71 @@
+services:
+  # ============================================================================
+  # 1. MoneyLens REST API Backend Service
+  # ============================================================================
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: moneylens-api
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      - NODE_ENV=production
+      - PORT=4000
+      - MONGODB_URI=mongodb://mongo:27017/moneylens?replicaSet=rs0&directConnection=true
+      - FRONTEND_URL=http://localhost:80,http://localhost:5173
+      - CORS_ORIGIN=http://localhost:80,http://localhost:5173
+      - LOG_LEVEL=info
+      - RATE_LIMIT_WINDOW_MS=900000
+      - RATE_LIMIT_MAX_REQUESTS=100
+      - GEMINI_API_KEY=
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+  # ============================================================================
+  # 2. MoneyLens SPA Web Frontend (Nginx Alpine)
+  # ============================================================================
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        - VITE_API_URL=http://localhost:4000/api/v1
+    container_name: moneylens-web
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - api
+
+  # ============================================================================
+  # 3. MongoDB 7.0 Service (Replica Set enabled for ACID transactions)
+  # ============================================================================
+  mongo:
+    image: mongo:7.0
+    container_name: moneylens-mongo
+    restart: unless-stopped
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: >
+        mongosh --eval '
+          try {
+            rs.status().ok;
+          } catch (e) {
+            rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "mongo:27017" }] }).ok;
+          }
+        '
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  mongodb_data:
+    driver: local

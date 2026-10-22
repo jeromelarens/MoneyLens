@@ -1,0 +1,594 @@
+import crypto from 'node:crypto';
+import type {
+  BusinessAction,
+  ActionHistory,
+  ActionTransitionRequest,
+  ActionListQuery,
+  ActionListResponse,
+  ActionDashboardSummary,
+  ActionEvaluationSummary,
+  ActionStatus,
+  ActionCurrencySummary,
+  SupportedCurrency,
+} from '@moneylens/shared';
+import { ERROR_CODES } from '@moneylens/shared';
+import {
+  BusinessActionModel,
+  ActionHistoryModel,
+  FinancialFindingModel,
+  ForecastRunModel,
+  CashFlowForecastModel,
+  TransactionModel,
+  FinancialAccountModel,
+  type IBusinessAction,
+  type IActionHistory,
+  type IFinancialFinding,
+  type ICashFlowForecast,
+  type IForecastRun,
+} from '../../infrastructure/database/models/index.js';
+import { AppError } from '../../middleware/error-handler.js';
+import { ActionRecommendationEngine } from './recommendation-engine.js';
+import type { ActionRuleContext } from './rule.interface.js';
+
+const VALID_TRANSITIONS: Record<ActionStatus, ActionStatus[]> = {
+  open: ['in_progress', 'completed', 'dismissed', 'snoozed', 'superseded'],
+  in_progress: ['open', 'completed', 'dismissed', 'snoozed', 'superseded'],
+  snoozed: ['open', 'in_progress', 'completed', 'dismissed'],
+  completed: ['open'],
+  dismissed: ['open'],
+  superseded: [],
+};
+
+export class ActionService {
+  private readonly engine: ActionRecommendationEngine;
+
+  constructor(engine?: ActionRecommendationEngine) {
+    this.engine = engine || new ActionRecommendationEngine();
+  }
+
+  /**
+   * Evaluates current supported evidence and generates, updates, or supersedes actions.
+   */
+  public async evaluateActions(organizationId: string): Promise<ActionEvaluationSummary> {
+    const evaluatedAt = new Date();
+
+    // 1. Fetch current tenant-scoped context
+    const findings = await FinancialFindingModel.find({ organizationId }).lean().exec();
+    const latestForecastRun = await ForecastRunModel.findOne({
+      organizationId,
+      status: { $in: ['completed', 'completed_with_warnings'] },
+    })
+      .sort({ createdAt: -1 })
+      .lean()
+      .exec();
+
+    const latestForecasts = latestForecastRun
+      ? await CashFlowForecastModel.find({
+          organizationId,
+          forecastRunId: latestForecastRun._id,
+        })
+          .lean()
+          .exec()
+      : [];
+
+    const transactionsCount = await TransactionModel.countDocuments({ organizationId });
+    const accountsCount = await FinancialAccountModel.countDocuments({ organizationId });
+
+    const context: ActionRuleContext = {
+      organizationId,
+      findings: findings as unknown as IFinancialFinding[],
+      latestForecasts: latestForecasts as unknown as ICashFlowForecast[],
+      latestForecastRun: latestForecastRun as unknown as IForecastRun | null,
+      transactionsCount,
+      accountsCount,
+    };
+
+    // 2. Deterministically evaluate candidate recommendations
+    const candidates = this.engine.evaluate(context);
+
+    // 3. Reconcile with existing database actions
+    const existingActions = await BusinessActionModel.find({ organizationId }).exec();
+    const existingByFingerprint = new Map<string, IBusinessAction>();
+    for (const action of existingActions) {
+      existingByFingerprint.set(action.fingerprint, action);
+    }
+
+    let createdCount = 0;
+    let updatedCount = 0;
+    let unchangedCount = 0;
+    const matchedFingerprints = new Set<string>();
+
+    for (const candidate of candidates) {
+      matchedFingerprints.add(candidate.fingerprint);
+      const existing = existingByFingerprint.get(candidate.fingerprint);
+
+      if (!existing) {
+        // Create new action
+        const newAction = new BusinessActionModel({
+          _id: crypto.randomUUID(),
+          organizationId,
+          actionType: candidate.actionType,
+          category: candidate.category,
+          title: candidate.title,
+          explanation: candidate.explanation,
+          priority: candidate.initialPriority,
+          priorityScore: candidate.initialPriorityScore,
+          severity: candidate.severity,
+          status: 'open',
+          evidence: candidate.evidence,
+          sourceFindingIds: candidate.sourceFindingIds,
+          sourceForecastRunId: candidate.sourceForecastRunId ?? null,
+          currency: candidate.currency ?? null,
+          financialImpact: candidate.financialImpact,
+          evidenceQuality: candidate.evidenceQuality,
+          recommendedSteps: candidate.recommendedSteps,
+          ruleId: candidate.ruleId,
+          ruleVersion: candidate.ruleVersion,
+          fingerprint: candidate.fingerprint,
+          lastEvaluatedAt: evaluatedAt,
+        });
+
+        try {
+          await newAction.save();
+
+          await ActionHistoryModel.create({
+            _id: crypto.randomUUID(),
+            organizationId,
+            actionId: newAction._id,
+            previousStatus: null,
+            nextStatus: 'open',
+            eventType: 'created',
+            actorId: 'system',
+            reason: `Action generated by recommendation rule ${candidate.ruleId}`,
+            notes: null,
+            metadata: { ruleVersion: candidate.ruleVersion },
+          });
+
+          createdCount++;
+        } catch (saveErr: unknown) {
+          const err = saveErr as { code?: number; message?: string };
+          if (err?.code === 11000 || err?.message?.includes('E11000')) {
+            // Concurrent evaluation already inserted this action - safely deduplicate
+            unchangedCount++;
+          } else {
+            throw saveErr;
+          }
+        }
+      } else {
+        // Handle existing action lifecycle state
+        if (existing.status === 'snoozed') {
+          // Check snooze expiration
+          if (existing.snoozedUntil && new Date(existing.snoozedUntil) <= evaluatedAt) {
+            existing.status = 'open';
+            existing.snoozedUntil = null;
+            existing.lastEvaluatedAt = evaluatedAt;
+            existing.priority = candidate.initialPriority;
+            existing.priorityScore = candidate.initialPriorityScore;
+            existing.financialImpact = candidate.financialImpact;
+            existing.evidence = candidate.evidence;
+            await existing.save();
+
+            await ActionHistoryModel.create({
+              _id: crypto.randomUUID(),
+              organizationId,
+              actionId: existing._id,
+              previousStatus: 'snoozed',
+              nextStatus: 'open',
+              eventType: 'status_transition',
+              actorId: 'system',
+              reason: 'Snooze period elapsed. Action reopened for review.',
+            });
+
+            updatedCount++;
+          } else {
+            // Still snoozed, retain status
+            existing.lastEvaluatedAt = evaluatedAt;
+            await existing.save();
+            unchangedCount++;
+          }
+        } else if (existing.status === 'completed' || existing.status === 'dismissed') {
+          // User completed or dismissed: preserve decision, do not reopen automatically
+          existing.lastEvaluatedAt = evaluatedAt;
+          await existing.save();
+          unchangedCount++;
+        } else if (existing.status === 'superseded') {
+          // Retain superseded status
+          existing.lastEvaluatedAt = evaluatedAt;
+          await existing.save();
+          unchangedCount++;
+        } else {
+          // Open or in_progress: refresh mutable evidence and scoring
+          existing.priority = candidate.initialPriority;
+          existing.priorityScore = candidate.initialPriorityScore;
+          existing.severity = candidate.severity;
+          existing.financialImpact = candidate.financialImpact;
+          existing.evidence = candidate.evidence;
+          existing.recommendedSteps = candidate.recommendedSteps;
+          existing.lastEvaluatedAt = evaluatedAt;
+          await existing.save();
+
+          await ActionHistoryModel.create({
+            _id: crypto.randomUUID(),
+            organizationId,
+            actionId: existing._id,
+            previousStatus: existing.status,
+            nextStatus: existing.status,
+            eventType: 're_evaluated',
+            actorId: 'system',
+            reason: 'Recommendation evidence and priority score refreshed.',
+          });
+
+          updatedCount++;
+        }
+      }
+    }
+
+    // 4. Supersede open/in_progress actions whose underlying evidence disappeared or resolved
+    let supersededCount = 0;
+    for (const [fingerprint, existing] of existingByFingerprint.entries()) {
+      if (!matchedFingerprints.has(fingerprint)) {
+        if (existing.status === 'open' || existing.status === 'in_progress') {
+          const prevStatus = existing.status;
+          existing.status = 'superseded';
+          existing.lastEvaluatedAt = evaluatedAt;
+          await existing.save();
+
+          await ActionHistoryModel.create({
+            _id: crypto.randomUUID(),
+            organizationId,
+            actionId: existing._id,
+            previousStatus: prevStatus,
+            nextStatus: 'superseded',
+            eventType: 'superseded',
+            actorId: 'system',
+            reason:
+              'Underlying financial evidence resolved or superseded by updated ledger/forecast state.',
+          });
+
+          supersededCount++;
+        }
+      }
+    }
+
+    return {
+      totalEvaluated: candidates.length,
+      createdCount,
+      updatedCount,
+      supersededCount,
+      unchangedCount,
+      evaluatedAt: evaluatedAt.toISOString(),
+    };
+  }
+
+  /**
+   * Retrieves paginated actions matching validated filter criteria.
+   */
+  public async getActions(
+    organizationId: string,
+    query: ActionListQuery,
+  ): Promise<ActionListResponse> {
+    const filter: Record<string, unknown> = { organizationId };
+
+    if (query.status) filter.status = query.status;
+    if (query.priority) filter.priority = query.priority;
+    if (query.category) filter.category = query.category;
+    if (query.currency) filter.currency = query.currency;
+
+    if (query.search && query.search.trim().length > 0) {
+      const rawSearch = query.search.trim().slice(0, 100);
+      const escapedSearch = rawSearch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      filter.$or = [
+        { title: { $regex: escapedSearch, $options: 'i' } },
+        { explanation: { $regex: escapedSearch, $options: 'i' } },
+      ];
+    }
+
+    let sortField: string = query.sortBy || 'priorityScore';
+    if (sortField === 'potentialExposureMinor') {
+      sortField = 'financialImpact.potentialExposureMinor';
+    }
+    const sortDir = query.sortOrder === 'asc' ? 1 : -1;
+    const sort: Record<string, 1 | -1> = { [sortField]: sortDir, createdAt: -1 };
+
+    const page = Math.max(1, query.page || 1);
+    const limit = Math.min(100, Math.max(1, query.limit || 20));
+    const skip = (page - 1) * limit;
+
+    const [docs, total] = await Promise.all([
+      BusinessActionModel.find(filter).sort(sort).skip(skip).limit(limit).exec(),
+      BusinessActionModel.countDocuments(filter).exec(),
+    ]);
+
+    const totalPages = Math.ceil(total / limit) || 1;
+
+    return {
+      items: docs.map((doc) => this.toActionContract(doc)),
+      pagination: {
+        page,
+        limit,
+        totalItems: total,
+        totalPages,
+      },
+    };
+  }
+
+  /**
+   * Retrieves a single action with source evidence and verification check.
+   */
+  public async getActionById(organizationId: string, actionId: string): Promise<BusinessAction> {
+    const doc = await BusinessActionModel.findOne({
+      _id: actionId,
+      organizationId,
+    }).exec();
+
+    if (!doc) {
+      throw new AppError(404, ERROR_CODES.ACTION_NOT_FOUND, 'Business action not found');
+    }
+
+    return this.toActionContract(doc);
+  }
+
+  /**
+   * Performs a validated lifecycle state transition.
+   */
+  public async transitionAction(
+    organizationId: string,
+    actionId: string,
+    request: ActionTransitionRequest,
+    actorId = 'user',
+  ): Promise<BusinessAction> {
+    const action = await BusinessActionModel.findOne({
+      _id: actionId,
+      organizationId,
+    }).exec();
+
+    if (!action) {
+      throw new AppError(404, ERROR_CODES.ACTION_NOT_FOUND, 'Business action not found');
+    }
+
+    const currentStatus = action.status;
+    const targetStatus = request.status;
+
+    if (currentStatus === targetStatus) {
+      throw new AppError(
+        400,
+        ERROR_CODES.INVALID_ACTION_TRANSITION,
+        `Action is already in '${targetStatus}' status`,
+      );
+    }
+
+    const allowed = VALID_TRANSITIONS[currentStatus] || [];
+    if (!allowed.includes(targetStatus)) {
+      throw new AppError(
+        400,
+        ERROR_CODES.INVALID_ACTION_TRANSITION,
+        `Cannot transition action from '${currentStatus}' to '${targetStatus}'`,
+      );
+    }
+
+    let eventType: ActionHistory['eventType'] = 'status_transition';
+    const now = new Date();
+
+    if (targetStatus === 'dismissed') {
+      if (!request.reason || request.reason.trim().length === 0) {
+        throw new AppError(
+          400,
+          ERROR_CODES.DISMISSAL_REASON_REQUIRED,
+          'A non-empty dismissal reason is required when dismissing an action',
+        );
+      }
+      action.dismissedAt = now;
+      action.dismissalReason = request.reason.trim();
+      eventType = 'dismissed';
+    } else if (targetStatus === 'completed') {
+      action.completedAt = now;
+      action.completionNotes = request.notes?.trim() || null;
+      eventType = 'completed';
+    } else if (targetStatus === 'snoozed') {
+      if (!request.snoozedUntil) {
+        throw new AppError(
+          400,
+          ERROR_CODES.INVALID_SNOOZE_DATE,
+          'A future snooze date (snoozedUntil) is required to snooze an action',
+        );
+      }
+      const snoozeDate = new Date(request.snoozedUntil);
+      if (isNaN(snoozeDate.getTime()) || snoozeDate.getTime() <= Date.now()) {
+        throw new AppError(
+          400,
+          ERROR_CODES.INVALID_SNOOZE_DATE,
+          'Snooze deadline must be a valid ISO date in the future',
+        );
+      }
+      action.snoozedUntil = snoozeDate;
+      eventType = 'snoozed';
+    } else if (targetStatus === 'open') {
+      if (currentStatus === 'completed' || currentStatus === 'dismissed') {
+        eventType = 'reopened';
+      }
+      action.snoozedUntil = null;
+      action.completedAt = null;
+      action.completionNotes = null;
+      action.dismissedAt = null;
+      action.dismissalReason = null;
+    } else if (targetStatus === 'in_progress') {
+      action.snoozedUntil = null;
+    }
+
+    action.status = targetStatus;
+    action.updatedAt = now;
+    await action.save();
+
+    await ActionHistoryModel.create({
+      _id: crypto.randomUUID(),
+      organizationId,
+      actionId: action._id,
+      previousStatus: currentStatus,
+      nextStatus: targetStatus,
+      eventType,
+      actorId,
+      reason: request.reason?.trim() || null,
+      notes: request.notes?.trim() || null,
+      metadata: request.snoozedUntil ? { snoozedUntil: request.snoozedUntil } : null,
+    });
+
+    return this.toActionContract(action);
+  }
+
+  /**
+   * Retrieves the chronological audit history trail for an action.
+   */
+  public async getActionHistory(
+    organizationId: string,
+    actionId: string,
+  ): Promise<ActionHistory[]> {
+    // Verify action existence and tenant isolation
+    const exists = await BusinessActionModel.exists({ _id: actionId, organizationId });
+    if (!exists) {
+      throw new AppError(404, ERROR_CODES.ACTION_NOT_FOUND, 'Business action not found');
+    }
+
+    const docs = await ActionHistoryModel.find({ organizationId, actionId })
+      .sort({ createdAt: 1 })
+      .exec();
+
+    return docs.map((doc) => this.toHistoryContract(doc));
+  }
+
+  /**
+   * Aggregates executive dashboard metrics with segregated currency summaries.
+   */
+  public async getSummary(organizationId: string): Promise<ActionDashboardSummary> {
+    const actions = await BusinessActionModel.find({ organizationId }).exec();
+
+    let totalOpen = 0;
+    let totalInProgress = 0;
+    let totalSnoozed = 0;
+    let totalCompleted = 0;
+    let totalDismissed = 0;
+    let criticalPriorityCount = 0;
+    let highPriorityCount = 0;
+    let mediumPriorityCount = 0;
+    let lowPriorityCount = 0;
+    let latestEvaluated: Date | null = null;
+
+    const byCurrency: Record<string, ActionCurrencySummary> = {};
+
+    for (const act of actions) {
+      if (act.status === 'open') totalOpen++;
+      else if (act.status === 'in_progress') totalInProgress++;
+      else if (act.status === 'snoozed') totalSnoozed++;
+      else if (act.status === 'completed') totalCompleted++;
+      else if (act.status === 'dismissed') totalDismissed++;
+
+      if (act.lastEvaluatedAt) {
+        const evalTime = new Date(act.lastEvaluatedAt);
+        if (!latestEvaluated || evalTime > latestEvaluated) {
+          latestEvaluated = evalTime;
+        }
+      }
+
+      // Track active priorities (open + in_progress)
+      if (act.status === 'open' || act.status === 'in_progress') {
+        if (act.priority === 'critical') criticalPriorityCount++;
+        else if (act.priority === 'high') highPriorityCount++;
+        else if (act.priority === 'medium') mediumPriorityCount++;
+        else if (act.priority === 'low') lowPriorityCount++;
+
+        // Segregated currency accumulation
+        const cur = act.currency as SupportedCurrency;
+        if (cur) {
+          if (!byCurrency[cur]) {
+            byCurrency[cur] = {
+              currency: cur,
+              potentialExposureMinor: 0,
+              estimatedAvoidableCostMinor: 0,
+              confirmedIssueMinor: 0,
+              realizedSavingsMinor: 0,
+              actionCount: 0,
+            };
+          }
+
+          const impact = act.financialImpact;
+          if (impact && impact.currency === cur) {
+            byCurrency[cur].potentialExposureMinor += impact.potentialExposureMinor || 0;
+            byCurrency[cur].estimatedAvoidableCostMinor += impact.estimatedAvoidableCostMinor || 0;
+            byCurrency[cur].confirmedIssueMinor += impact.confirmedIssueMinor || 0;
+            byCurrency[cur].realizedSavingsMinor += impact.realizedSavingsMinor || 0;
+          }
+          byCurrency[cur].actionCount++;
+        }
+      }
+    }
+
+    return {
+      totalOpen,
+      totalInProgress,
+      totalSnoozed,
+      totalCompleted,
+      totalDismissed,
+      criticalPriorityCount,
+      highPriorityCount,
+      mediumPriorityCount,
+      lowPriorityCount,
+      byCurrency,
+      lastEvaluatedAt: latestEvaluated ? latestEvaluated.toISOString() : null,
+    };
+  }
+
+  private toActionContract(doc: IBusinessAction): BusinessAction {
+    return {
+      id: doc._id,
+      organizationId: doc.organizationId,
+      actionType: doc.actionType,
+      category: doc.category,
+      title: doc.title,
+      explanation: doc.explanation,
+      priority: doc.priority,
+      priorityScore: doc.priorityScore,
+      severity: doc.severity,
+      status: doc.status,
+      evidence: doc.evidence || {},
+      sourceFindingIds: doc.sourceFindingIds || [],
+      sourceForecastRunId: doc.sourceForecastRunId ?? null,
+      currency: (doc.currency as SupportedCurrency) ?? null,
+      financialImpact: {
+        currency: (doc.financialImpact?.currency as SupportedCurrency) ?? null,
+        potentialExposureMinor: doc.financialImpact?.potentialExposureMinor ?? 0,
+        estimatedAvoidableCostMinor: doc.financialImpact?.estimatedAvoidableCostMinor ?? 0,
+        confirmedIssueMinor: doc.financialImpact?.confirmedIssueMinor ?? 0,
+        projectedCashFlowEffectMinor: doc.financialImpact?.projectedCashFlowEffectMinor ?? 0,
+        realizedSavingsMinor: doc.financialImpact?.realizedSavingsMinor ?? 0,
+      },
+      evidenceQuality: doc.evidenceQuality,
+      recommendedSteps: doc.recommendedSteps || [],
+      ruleId: doc.ruleId,
+      ruleVersion: doc.ruleVersion,
+      fingerprint: doc.fingerprint,
+      snoozedUntil: doc.snoozedUntil ? new Date(doc.snoozedUntil).toISOString() : null,
+      completedAt: doc.completedAt ? new Date(doc.completedAt).toISOString() : null,
+      completionNotes: doc.completionNotes ?? null,
+      dismissedAt: doc.dismissedAt ? new Date(doc.dismissedAt).toISOString() : null,
+      dismissalReason: doc.dismissalReason ?? null,
+      createdAt: new Date(doc.createdAt).toISOString(),
+      updatedAt: new Date(doc.updatedAt).toISOString(),
+      lastEvaluatedAt: new Date(doc.lastEvaluatedAt).toISOString(),
+    };
+  }
+
+  private toHistoryContract(doc: IActionHistory): ActionHistory {
+    return {
+      id: doc._id,
+      organizationId: doc.organizationId,
+      actionId: doc.actionId,
+      previousStatus: (doc.previousStatus as ActionStatus) ?? null,
+      nextStatus: doc.nextStatus as ActionStatus,
+      eventType: doc.eventType,
+      actorId: doc.actorId,
+      reason: doc.reason ?? null,
+      notes: doc.notes ?? null,
+      metadata: doc.metadata ?? null,
+      createdAt: new Date(doc.createdAt).toISOString(),
+    };
+  }
+}
