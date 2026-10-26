@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { MemoryRouter } from 'react-router-dom';
 import { CashFlowDashboard } from '../components/CashFlowDashboard';
 import * as financialServiceModule from '../services/financial.service';
 import type {
@@ -8,6 +9,7 @@ import type {
   CashFlowForecast,
   ForecastRun,
   ScenarioCalculationResult,
+  CashFlowScenario,
 } from '@moneylens/shared';
 
 describe('CashFlowDashboard Component Suite', () => {
@@ -140,6 +142,22 @@ describe('CashFlowDashboard Component Suite', () => {
     adjustmentsApplied: ['Applied -15% adjustment to non-recurring revenues.'],
   };
 
+  const mockSavedScenario: CashFlowScenario = {
+    id: 'scen-saved-1',
+    organizationId: 'org-test',
+    name: 'Q3 Worst-Case Revenue Slump',
+    currency: 'USD',
+    horizonDays: 30,
+    assumptions: {
+      revenueChangePercent: -25,
+      expenseChangePercent: 10,
+      recurringAdjustments: [],
+      oneTimeEvents: [],
+    },
+    createdAt: '2026-03-20T11:00:00.000Z',
+    updatedAt: '2026-03-20T11:00:00.000Z',
+  };
+
   beforeEach(() => {
     vi.restoreAllMocks();
     queryClient = new QueryClient({
@@ -167,13 +185,28 @@ describe('CashFlowDashboard Component Suite', () => {
     vi.spyOn(financialServiceModule.financialService, 'simulateScenario').mockResolvedValue(
       mockSimulationResult,
     );
+
+    vi.spyOn(financialServiceModule.financialService, 'listScenarios').mockResolvedValue({
+      items: [mockSavedScenario],
+      pagination: { page: 1, limit: 20, totalItems: 1, totalPages: 1 },
+    });
+
+    vi.spyOn(financialServiceModule.financialService, 'createScenario').mockResolvedValue(
+      mockSavedScenario,
+    );
+
+    vi.spyOn(financialServiceModule.financialService, 'deleteScenario').mockResolvedValue({
+      message: 'Scenario deleted successfully',
+    });
   });
 
   const renderDashboard = () =>
     render(
-      <QueryClientProvider client={queryClient}>
-        <CashFlowDashboard />
-      </QueryClientProvider>,
+      <MemoryRouter>
+        <QueryClientProvider client={queryClient}>
+          <CashFlowDashboard />
+        </QueryClientProvider>
+      </MemoryRouter>,
     );
 
   it('renders executive summary cards and net movement without fabricating opening balance', async () => {
@@ -316,6 +349,106 @@ describe('CashFlowDashboard Component Suite', () => {
       expect(screen.getByText(/Moving average run rate used\./i)).toBeInTheDocument();
       expect(
         screen.getByText(/Net cash movement only without opening bank balance\./i),
+      ).toBeInTheDocument();
+    });
+  });
+
+  it('toggles between Chart View and Projection Table view and renders tabular ledger', async () => {
+    renderDashboard();
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Projection Table/i })).toBeInTheDocument();
+    });
+
+    // Switch to Projection Table View
+    fireEvent.click(screen.getByRole('button', { name: /Projection Table/i }));
+
+    // Verify Table Headers & Rows
+    expect(
+      screen.getByRole('columnheader', { name: /Scheduled Obligations/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText('2026-03-21')).toBeInTheDocument();
+    expect(screen.getByText('2026-03-22')).toBeInTheDocument();
+
+    // Switch back to Chart View
+    fireEvent.click(screen.getByRole('button', { name: /Chart View/i }));
+    expect(screen.getByLabelText(/Cash Flow Forecast Chart/i)).toBeInTheDocument();
+  });
+
+  it('saves a hypothetical scenario through the Save Scenario modal', async () => {
+    renderDashboard();
+
+    await waitFor(() => {
+      expect(screen.getByText(/What-If Scenario Simulator & Stress Testing/i)).toBeInTheDocument();
+    });
+
+    // Run simulation to display scenario results and Save Scenario action
+    const simulateBtn = screen.getByRole('button', { name: /Simulate Scenario Impact/i });
+    fireEvent.click(simulateBtn);
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Save Scenario/i })).toBeInTheDocument();
+    });
+
+    // Click Save Scenario
+    fireEvent.click(screen.getByRole('button', { name: /Save Scenario/i }));
+
+    expect(screen.getByText(/Save Hypothetical Scenario/i)).toBeInTheDocument();
+    const nameInput = screen.getByLabelText(/Scenario Name/i);
+    fireEvent.change(nameInput, { target: { value: 'Q3 Worst-Case Revenue Slump' } });
+
+    // Submit save
+    const modalSaveBtn = screen.getAllByRole('button', { name: /Save Scenario/i })[1]!;
+    fireEvent.click(modalSaveBtn);
+
+    await waitFor(() => {
+      expect(financialServiceModule.financialService.createScenario).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: 'Q3 Worst-Case Revenue Slump',
+          currency: 'USD',
+          horizon: '30d',
+        }),
+      );
+    });
+  });
+
+  it('displays saved scenarios list and allows loading a saved scenario into the simulator', async () => {
+    renderDashboard();
+
+    await waitFor(() => {
+      expect(screen.getByText(/Saved Hypothetical Scenarios/i)).toBeInTheDocument();
+      expect(screen.getByText('Q3 Worst-Case Revenue Slump')).toBeInTheDocument();
+    });
+
+    const loadBtn = screen.getByRole('button', { name: /Load in Simulator/i });
+    fireEvent.click(loadBtn);
+
+    await waitFor(() => {
+      expect(financialServiceModule.financialService.simulateScenario).toHaveBeenCalledWith(
+        expect.objectContaining({
+          currency: 'USD',
+          assumptions: expect.objectContaining({
+            revenueChangePercent: -25,
+            expenseChangePercent: 10,
+          }),
+        }),
+      );
+    });
+  });
+
+  it('renders an honest empty state when no forecast run exists on file', async () => {
+    vi.spyOn(financialServiceModule.financialService, 'getCashFlowSummary').mockResolvedValue({
+      byCurrency: {},
+      lastRunAt: null,
+      totalForecastRuns: 0,
+    });
+
+    renderDashboard();
+
+    await waitFor(() => {
+      expect(screen.getByText(/No Forecast Run on File/i)).toBeInTheDocument();
+      expect(
+        screen.getByRole('button', { name: /Initialize First Forecast Run/i }),
       ).toBeInTheDocument();
     });
   });

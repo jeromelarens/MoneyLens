@@ -11,6 +11,7 @@ import type {
   SupportedCurrency,
   PerRuleRunResult,
   AiExplanation,
+  Transaction,
 } from '@moneylens/shared';
 import { ERROR_CODES } from '@moneylens/shared';
 import {
@@ -304,7 +305,7 @@ export class FindingService {
     findingId: string,
   ): Promise<{
     finding: FinancialFinding;
-    transactions: ITransaction[];
+    transactions: Transaction[];
     history: FindingHistory[];
   }> {
     const finding = await FinancialFindingModel.findOne({
@@ -334,7 +335,7 @@ export class FindingService {
 
     return {
       finding: this.toFindingContract(finding),
-      transactions,
+      transactions: transactions.map((t) => this.toTransactionContract(t)),
       history: historyDocs.map((h) => this.toFindingHistoryContract(h)),
     };
   }
@@ -641,6 +642,26 @@ export class FindingService {
       reason: doc.reason || null,
       notes: doc.notes || null,
       createdAt: doc.createdAt.toISOString(),
+    };
+  }
+
+  private toTransactionContract(doc: ITransaction): Transaction {
+    return {
+      id: doc._id,
+      organizationId: doc.organizationId,
+      accountId: doc.accountId,
+      importJobId: doc.importJobId,
+      date: doc.date.toISOString(),
+      description: doc.description,
+      direction: doc.direction,
+      amountMinor: doc.amountMinor,
+      amountDecimal: doc.amountDecimal,
+      currency: doc.currency,
+      sourceReference: doc.sourceReference || null,
+      fingerprint: doc.fingerprint,
+      rawSourceData: (doc.rawSourceData as Record<string, string>) || null,
+      createdAt: doc.createdAt.toISOString(),
+      updatedAt: doc.updatedAt.toISOString(),
     };
   }
 }

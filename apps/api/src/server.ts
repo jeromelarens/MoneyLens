@@ -4,6 +4,7 @@ import { connectDatabase, disconnectDatabase } from './infrastructure/database/m
 import { logger } from './infrastructure/observability/logger.js';
 import type { Server } from 'node:http';
 
+// Backend server entrypoint - reloaded with local mongodb
 async function startServer(): Promise<void> {
   // 1. Validate environment configuration before booting
   let config;

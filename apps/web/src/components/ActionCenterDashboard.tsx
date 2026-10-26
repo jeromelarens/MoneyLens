@@ -1,5 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
+import { Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { Layout } from './Layout';
 import { financialService } from '../services/financial.service';
 import type {
   BusinessAction,
@@ -7,6 +9,7 @@ import type {
   ActionPriority,
   ActionCategory,
   ActionTransitionRequest,
+  SupportedCurrency,
 } from '@moneylens/shared';
 import { formatCurrencyAmount } from '@moneylens/shared';
 import {
@@ -26,16 +29,33 @@ import {
   DollarSign,
   ShieldCheck,
   RotateCcw,
+  ExternalLink,
+  ArrowRight,
+  Check,
 } from 'lucide-react';
 
-export const ActionCenterDashboard: React.FC = () => {
+export const ActionCenterDashboard: React.FC<{ inShell?: boolean }> = ({ inShell = true }) => {
   const queryClient = useQueryClient();
+
+  // Document Title
+  useEffect(() => {
+    const originalTitle = document.title;
+    document.title = 'Business Action Center — MoneyLens';
+    return () => {
+      document.title = originalTitle;
+    };
+  }, []);
 
   // Filters State
   const [selectedStatus, setSelectedStatus] = useState<ActionStatus | 'all'>('open');
   const [selectedPriority, setSelectedPriority] = useState<ActionPriority | 'all'>('all');
   const [selectedCategory, setSelectedCategory] = useState<ActionCategory | 'all'>('all');
+  const [selectedCurrency, setSelectedCurrency] = useState<SupportedCurrency | 'all'>('all');
   const [searchTerm, setSearchTerm] = useState<string>('');
+  const [sortBy, setSortBy] = useState<
+    'priorityScore' | 'potentialExposureMinor' | 'createdAt' | 'updatedAt'
+  >('priorityScore');
+  const [sortOrder, setSortOrder] = useState<'desc' | 'asc'>('desc');
   const [page, setPage] = useState<number>(1);
 
   // Detail Modal State
@@ -49,10 +69,33 @@ export const ActionCenterDashboard: React.FC = () => {
   const [snoozeDays, setSnoozeDays] = useState<number>(7);
   const [transitionError, setTransitionError] = useState<string | null>(null);
 
+  // User Notification Banner
+  const [successBanner, setSuccessBanner] = useState<string | null>(null);
+
+  // Modal Scroll Lock & Escape Dismiss
+  useEffect(() => {
+    const isAnyModalOpen = Boolean(selectedActionId || transitionAction);
+    if (isAnyModalOpen) {
+      document.body.style.overflow = 'hidden';
+      const handleKeyDown = (e: KeyboardEvent) => {
+        if (e.key === 'Escape') {
+          setSelectedActionId(null);
+          closeTransitionDialog();
+        }
+      };
+      window.addEventListener('keydown', handleKeyDown);
+      return () => {
+        document.body.style.overflow = '';
+        window.removeEventListener('keydown', handleKeyDown);
+      };
+    }
+  }, [selectedActionId, transitionAction]);
+
   // 1. Action Summary Query
   const { data: summaryData, isLoading: isSummaryLoading } = useQuery({
     queryKey: ['actions-summary'],
     queryFn: financialService.getActionSummary,
+    staleTime: 30000,
   });
 
   // 2. Action List Query
@@ -68,7 +111,10 @@ export const ActionCenterDashboard: React.FC = () => {
       selectedStatus,
       selectedPriority,
       selectedCategory,
+      selectedCurrency,
       searchTerm,
+      sortBy,
+      sortOrder,
     ],
     queryFn: () =>
       financialService.getActions({
@@ -77,10 +123,12 @@ export const ActionCenterDashboard: React.FC = () => {
         status: selectedStatus === 'all' ? undefined : selectedStatus,
         priority: selectedPriority === 'all' ? undefined : selectedPriority,
         category: selectedCategory === 'all' ? undefined : selectedCategory,
+        currency: selectedCurrency === 'all' ? undefined : selectedCurrency,
         search: searchTerm.trim() || undefined,
-        sortBy: 'priorityScore',
-        sortOrder: 'desc',
+        sortBy,
+        sortOrder,
       }),
+    staleTime: 30000,
   });
 
   // 3. Action Detail Query
@@ -100,9 +148,20 @@ export const ActionCenterDashboard: React.FC = () => {
   // 5. Evaluate Actions Mutation
   const evaluateMutation = useMutation({
     mutationFn: financialService.evaluateActions,
-    onSuccess: () => {
+    onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['actions-summary'] });
       queryClient.invalidateQueries({ queryKey: ['actions-list'] });
+      const created = data?.data?.createdCount ?? 0;
+      const updated = data?.data?.updatedCount ?? 0;
+      const superseded = data?.data?.supersededCount ?? 0;
+      setSuccessBanner(
+        `Action evaluation complete: ${created} created, ${updated} refreshed, ${superseded} superseded.`,
+      );
+      setTimeout(() => setSuccessBanner(null), 6000);
+    },
+    onError: (err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      setTransitionError(msg || 'Evaluation failed. Please try again.');
     },
   });
 
@@ -111,13 +170,17 @@ export const ActionCenterDashboard: React.FC = () => {
     mutationFn: async (params: { actionId: string; request: ActionTransitionRequest }) => {
       return financialService.transitionAction(params.actionId, params.request);
     },
-    onSuccess: () => {
+    onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: ['actions-summary'] });
       queryClient.invalidateQueries({ queryKey: ['actions-list'] });
       if (selectedActionId) {
         queryClient.invalidateQueries({ queryKey: ['action-detail', selectedActionId] });
         queryClient.invalidateQueries({ queryKey: ['action-history', selectedActionId] });
       }
+      setSuccessBanner(
+        `Action transitioned to "${variables.request.status.replace('_', ' ')}" status successfully.`,
+      );
+      setTimeout(() => setSuccessBanner(null), 5000);
       closeTransitionDialog();
     },
     onError: (err: unknown) => {
@@ -168,6 +231,37 @@ export const ActionCenterDashboard: React.FC = () => {
     });
   };
 
+  const resetFilters = () => {
+    setSelectedStatus('open');
+    setSelectedPriority('all');
+    setSelectedCategory('all');
+    setSelectedCurrency('all');
+    setSearchTerm('');
+    setSortBy('priorityScore');
+    setSortOrder('desc');
+    setPage(1);
+  };
+
+  const isFilterActive = useMemo(() => {
+    return (
+      selectedStatus !== 'open' ||
+      selectedPriority !== 'all' ||
+      selectedCategory !== 'all' ||
+      selectedCurrency !== 'all' ||
+      searchTerm !== '' ||
+      sortBy !== 'priorityScore' ||
+      sortOrder !== 'desc'
+    );
+  }, [
+    selectedStatus,
+    selectedPriority,
+    selectedCategory,
+    selectedCurrency,
+    searchTerm,
+    sortBy,
+    sortOrder,
+  ]);
+
   const summary = summaryData?.data;
   const actions = actionsData?.items || [];
   const pagination = actionsData?.pagination;
@@ -177,70 +271,104 @@ export const ActionCenterDashboard: React.FC = () => {
   const getPriorityBadge = (priority: ActionPriority) => {
     switch (priority) {
       case 'critical':
-        return 'bg-rose-950/80 text-rose-300 border-rose-800';
+        return 'bg-rose-50 text-rose-800 border-rose-200';
       case 'high':
-        return 'bg-amber-950/80 text-amber-300 border-amber-800';
+        return 'bg-amber-50 text-amber-800 border-amber-200';
       case 'medium':
-        return 'bg-sky-950/80 text-sky-300 border-sky-800';
+        return 'bg-sky-50 text-sky-800 border-sky-200';
       case 'low':
-        return 'bg-slate-800/80 text-slate-300 border-slate-700';
+        return 'bg-[#F8F7F2] text-[#66645C] border-[#DEDDD5]';
     }
   };
 
   const getCategoryBadge = (category: ActionCategory) => {
     switch (category) {
       case 'cash_preservation':
-        return 'bg-cyan-950/60 text-cyan-300 border-cyan-800';
+        return 'bg-cyan-50 text-cyan-800 border-cyan-200';
       case 'cost_reduction':
-        return 'bg-emerald-950/60 text-emerald-300 border-emerald-800';
+        return 'bg-emerald-50 text-emerald-800 border-emerald-200';
       case 'data_integrity':
-        return 'bg-indigo-950/60 text-indigo-300 border-indigo-800';
+        return 'bg-indigo-50 text-indigo-800 border-indigo-200';
       case 'vendor_management':
-        return 'bg-violet-950/60 text-violet-300 border-violet-800';
+        return 'bg-purple-50 text-purple-800 border-purple-200';
     }
   };
 
   const getStatusBadge = (status: ActionStatus) => {
     switch (status) {
       case 'open':
-        return 'bg-blue-950/60 text-blue-300 border-blue-800';
+        return 'bg-blue-50 text-blue-800 border-blue-200';
       case 'in_progress':
-        return 'bg-amber-950/60 text-amber-300 border-amber-800';
+        return 'bg-amber-50 text-amber-800 border-amber-200';
       case 'snoozed':
-        return 'bg-purple-950/60 text-purple-300 border-purple-800';
+        return 'bg-purple-50 text-purple-800 border-purple-200';
       case 'completed':
-        return 'bg-emerald-950/60 text-emerald-300 border-emerald-800';
+        return 'bg-emerald-50 text-emerald-800 border-emerald-200';
       case 'dismissed':
-        return 'bg-slate-800/60 text-slate-400 border-slate-700';
+        return 'bg-[#F8F7F2] text-[#66645C] border-[#DEDDD5]';
       case 'superseded':
-        return 'bg-slate-900 text-slate-500 border-slate-800';
+        return 'bg-slate-100 text-slate-500 border-slate-200';
     }
   };
 
-  return (
+  const bodyContent = (
     <div className="space-y-8">
-      {/* 1. Header & Evaluation Action */}
-      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 p-6 rounded-2xl bg-slate-900/60 border border-slate-800 backdrop-blur-sm">
+      {/* Breadcrumb Navigation */}
+      <nav aria-label="Breadcrumb" className="flex items-center gap-2 text-xs text-[#66645C]">
+        <Link to="/" className="hover:text-[#171714] transition-colors">
+          MoneyLens
+        </Link>
+        <span>/</span>
+        <Link to="/dashboard" className="hover:text-[#171714] transition-colors">
+          Treasury & Findings
+        </Link>
+        <span>/</span>
+        <span className="font-semibold text-[#171714]">Action Center</span>
+      </nav>
+
+      {/* Success Banner Notification */}
+      {successBanner && (
+        <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 flex items-center justify-between gap-3 shadow-2xs animate-in fade-in">
+          <div className="flex items-center gap-2 text-xs font-semibold">
+            <Check className="w-4 h-4 text-emerald-600" />
+            <span>{successBanner}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setSuccessBanner(null)}
+            className="text-emerald-700 hover:text-emerald-900 p-1"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {/* 2. Page Header & Evaluation Action */}
+      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-6 pb-6 border-b border-[#DEDDD5]">
         <div>
-          <div className="flex items-center gap-2">
-            <div className="p-2 rounded-lg bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-[#171714] text-[#E5BB45] flex items-center justify-center shadow-xs">
               <Zap className="w-5 h-5" />
             </div>
-            <h1 className="text-xl font-bold text-white tracking-tight">Business Action Center</h1>
-            <span className="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 font-medium border border-slate-700">
-              Decision Intelligence
-            </span>
+            <div>
+              <h1 className="font-serif text-3xl font-bold tracking-tight text-[#171714]">
+                Business Action Center
+              </h1>
+              <p className="text-xs font-semibold text-[#66645C] tracking-wide uppercase mt-0.5">
+                Evidence-Driven Operational Follow-Up
+              </p>
+            </div>
           </div>
-          <p className="text-sm text-slate-400 mt-1">
-            Prioritized, evidence-backed operational guidance synthesized from financial leakage
-            findings and cash-flow projections.
+          <p className="text-sm text-[#66645C] mt-2 max-w-3xl leading-relaxed">
+            Synthesizes confirmed ledger leakage, reconciliation anomalies, and forecast obligations
+            into prioritized, trackable operational tasks without speculative financial claims.
           </p>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex flex-col sm:flex-row items-end sm:items-center gap-3">
           {summary?.lastEvaluatedAt && (
-            <div className="text-xs text-slate-400 flex items-center gap-1.5">
-              <Clock className="w-3.5 h-3.5 text-slate-500" />
+            <div className="text-xs text-[#66645C] flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white border border-[#DEDDD5]">
+              <Clock className="w-3.5 h-3.5 text-[#E5BB45]" />
               <span>Evaluated: {new Date(summary.lastEvaluatedAt).toLocaleDateString()}</span>
             </div>
           )}
@@ -249,118 +377,131 @@ export const ActionCenterDashboard: React.FC = () => {
             type="button"
             onClick={() => evaluateMutation.mutate()}
             disabled={evaluateMutation.isPending}
-            className="flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 rounded-xl transition cursor-pointer shadow-lg shadow-indigo-600/20 disabled:opacity-50"
+            className="flex items-center gap-2 px-4 py-2 text-xs font-bold text-white bg-[#171714] hover:bg-[#2A2A26] active:bg-[#0D0D0B] rounded-xl transition cursor-pointer shadow-xs disabled:opacity-50"
           >
-            <RefreshCw className={`w-4 h-4 ${evaluateMutation.isPending ? 'animate-spin' : ''}`} />
+            <RefreshCw
+              className={`w-3.5 h-3.5 text-[#E5BB45] ${evaluateMutation.isPending ? 'animate-spin' : ''}`}
+            />
             <span>{evaluateMutation.isPending ? 'Evaluating...' : 'Evaluate Now'}</span>
           </button>
         </div>
       </div>
 
-      {/* 2. Executive Metrics Summary */}
-      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
+      {/* 3. Executive Metrics Summary */}
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
         {/* Urgent Actions */}
-        <div className="p-4 rounded-xl bg-slate-900/40 border border-slate-800">
-          <div className="flex items-center justify-between text-slate-400 text-xs font-medium">
+        <div className="p-4 rounded-xl bg-white border border-[#DEDDD5] shadow-2xs hover:shadow-xs transition">
+          <div className="flex items-center justify-between text-[#66645C] text-xs font-semibold">
             <span>Critical & High</span>
-            <AlertTriangle className="w-4 h-4 text-rose-400" />
+            <AlertTriangle className="w-4 h-4 text-rose-600" />
           </div>
-          <div className="text-2xl font-bold text-white mt-2">
+          <div className="text-2xl font-serif font-bold text-[#171714] mt-2">
             {isSummaryLoading
               ? '...'
               : (summary?.criticalPriorityCount || 0) + (summary?.highPriorityCount || 0)}
           </div>
-          <div className="text-[11px] text-slate-500 mt-1">Requires prompt attention</div>
+          <div className="text-[11px] text-[#66645C] mt-1 font-medium">Requires prompt review</div>
         </div>
 
         {/* Open Actions */}
-        <div className="p-4 rounded-xl bg-slate-900/40 border border-slate-800">
-          <div className="flex items-center justify-between text-slate-400 text-xs font-medium">
+        <div className="p-4 rounded-xl bg-white border border-[#DEDDD5] shadow-2xs hover:shadow-xs transition">
+          <div className="flex items-center justify-between text-[#66645C] text-xs font-semibold">
             <span>Open Tasks</span>
-            <AlertCircle className="w-4 h-4 text-blue-400" />
+            <AlertCircle className="w-4 h-4 text-blue-600" />
           </div>
-          <div className="text-2xl font-bold text-white mt-2">
+          <div className="text-2xl font-serif font-bold text-[#171714] mt-2">
             {isSummaryLoading ? '...' : summary?.totalOpen || 0}
           </div>
-          <div className="text-[11px] text-slate-500 mt-1">Awaiting decision</div>
+          <div className="text-[11px] text-[#66645C] mt-1 font-medium">Awaiting decision</div>
         </div>
 
         {/* In Progress */}
-        <div className="p-4 rounded-xl bg-slate-900/40 border border-slate-800">
-          <div className="flex items-center justify-between text-slate-400 text-xs font-medium">
+        <div className="p-4 rounded-xl bg-white border border-[#DEDDD5] shadow-2xs hover:shadow-xs transition">
+          <div className="flex items-center justify-between text-[#66645C] text-xs font-semibold">
             <span>In Progress</span>
-            <Play className="w-4 h-4 text-amber-400" />
+            <Play className="w-4 h-4 text-amber-600" />
           </div>
-          <div className="text-2xl font-bold text-white mt-2">
+          <div className="text-2xl font-serif font-bold text-[#171714] mt-2">
             {isSummaryLoading ? '...' : summary?.totalInProgress || 0}
           </div>
-          <div className="text-[11px] text-slate-500 mt-1">Active investigations</div>
+          <div className="text-[11px] text-[#66645C] mt-1 font-medium">Active investigations</div>
         </div>
 
         {/* Snoozed */}
-        <div className="p-4 rounded-xl bg-slate-900/40 border border-slate-800">
-          <div className="flex items-center justify-between text-slate-400 text-xs font-medium">
+        <div className="p-4 rounded-xl bg-white border border-[#DEDDD5] shadow-2xs hover:shadow-xs transition">
+          <div className="flex items-center justify-between text-[#66645C] text-xs font-semibold">
             <span>Snoozed</span>
-            <Clock className="w-4 h-4 text-purple-400" />
+            <Clock className="w-4 h-4 text-purple-600" />
           </div>
-          <div className="text-2xl font-bold text-white mt-2">
+          <div className="text-2xl font-serif font-bold text-[#171714] mt-2">
             {isSummaryLoading ? '...' : summary?.totalSnoozed || 0}
           </div>
-          <div className="text-[11px] text-slate-500 mt-1">Deferred review</div>
+          <div className="text-[11px] text-[#66645C] mt-1 font-medium">Deferred review</div>
         </div>
 
         {/* Completed */}
-        <div className="p-4 rounded-xl bg-slate-900/40 border border-slate-800">
-          <div className="flex items-center justify-between text-slate-400 text-xs font-medium">
+        <div className="p-4 rounded-xl bg-white border border-[#DEDDD5] shadow-2xs hover:shadow-xs transition">
+          <div className="flex items-center justify-between text-[#66645C] text-xs font-semibold">
             <span>Completed</span>
-            <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+            <CheckCircle2 className="w-4 h-4 text-emerald-600" />
           </div>
-          <div className="text-2xl font-bold text-white mt-2">
+          <div className="text-2xl font-serif font-bold text-[#171714] mt-2">
             {isSummaryLoading ? '...' : summary?.totalCompleted || 0}
           </div>
-          <div className="text-[11px] text-slate-500 mt-1">Resolved by owner</div>
+          <div className="text-[11px] text-[#66645C] mt-1 font-medium">Resolved by team</div>
         </div>
 
         {/* Dismissed */}
-        <div className="p-4 rounded-xl bg-slate-900/40 border border-slate-800">
-          <div className="flex items-center justify-between text-slate-400 text-xs font-medium">
+        <div className="p-4 rounded-xl bg-white border border-[#DEDDD5] shadow-2xs hover:shadow-xs transition">
+          <div className="flex items-center justify-between text-[#66645C] text-xs font-semibold">
             <span>Dismissed</span>
-            <Archive className="w-4 h-4 text-slate-400" />
+            <Archive className="w-4 h-4 text-[#66645C]" />
           </div>
-          <div className="text-2xl font-bold text-slate-400 mt-2">
+          <div className="text-2xl font-serif font-bold text-[#66645C] mt-2">
             {isSummaryLoading ? '...' : summary?.totalDismissed || 0}
           </div>
-          <div className="text-[11px] text-slate-500 mt-1">Documented reasons</div>
+          <div className="text-[11px] text-[#66645C] mt-1 font-medium">Documented reasons</div>
         </div>
       </div>
 
-      {/* 3. Evidence-Backed Financial Exposure (Segregated by Currency) */}
+      {/* 4. Evidence-Backed Financial Exposure (Strict Currency Segregation) */}
       {summary?.byCurrency && Object.keys(summary.byCurrency).length > 0 && (
-        <div className="p-5 rounded-2xl bg-slate-900/40 border border-slate-800">
-          <div className="flex items-center gap-2 mb-3">
-            <DollarSign className="w-4 h-4 text-emerald-400" />
-            <h3 className="text-sm font-semibold text-white">
-              Active Financial Exposure (Strict Currency Segregation)
-            </h3>
+        <div className="p-6 rounded-2xl bg-white border border-[#DEDDD5] shadow-2xs space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <div className="p-1.5 rounded-lg bg-emerald-50 text-emerald-700 border border-emerald-200">
+                <DollarSign className="w-4 h-4" />
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-[#171714]">
+                  Active Financial Exposure (Strict Currency Segregation)
+                </h3>
+                <p className="text-xs text-[#66645C]">
+                  Calculated strictly within verified currency buckets without speculative
+                  cross-currency conversions.
+                </p>
+              </div>
+            </div>
           </div>
+
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
             {Object.values(summary.byCurrency).map((item) => (
               <div
                 key={item.currency}
-                className="p-4 rounded-xl bg-slate-950/60 border border-slate-800/80 flex items-center justify-between"
+                className="p-4 rounded-xl bg-[#F8F7F2] border border-[#DEDDD5] flex items-center justify-between"
               >
                 <div>
-                  <div className="text-xs font-bold text-indigo-400">{item.currency} Exposure</div>
-                  <div className="text-xl font-bold text-white mt-1">
+                  <div className="text-xs font-bold text-[#171714]">{item.currency} Exposure</div>
+                  <div className="text-xl font-serif font-bold text-[#171714] mt-1">
                     {item.currency}{' '}
                     {formatCurrencyAmount(item.potentialExposureMinor, item.currency)}
                   </div>
-                  <div className="text-[11px] text-slate-400 mt-0.5">
+                  <div className="text-[11px] text-[#66645C] mt-0.5">
                     Est. Avoidable: {item.currency}{' '}
                     {formatCurrencyAmount(item.estimatedAvoidableCostMinor, item.currency)}
                   </div>
                 </div>
-                <div className="text-xs px-2.5 py-1 rounded-lg bg-slate-800 text-slate-300 border border-slate-700">
+                <div className="text-xs px-2.5 py-1 rounded-lg bg-white text-[#171714] font-semibold border border-[#DEDDD5] shadow-2xs">
                   {item.actionCount} {item.actionCount === 1 ? 'action' : 'actions'}
                 </div>
               </div>
@@ -369,19 +510,19 @@ export const ActionCenterDashboard: React.FC = () => {
         </div>
       )}
 
-      {/* 4. Filter Toolbar */}
-      <div className="p-4 rounded-xl bg-slate-900/40 border border-slate-800 flex flex-wrap items-center justify-between gap-4">
+      {/* 5. Filter Toolbar */}
+      <div className="p-4 rounded-2xl bg-white border border-[#DEDDD5] shadow-2xs flex flex-wrap items-center justify-between gap-4">
         <div className="flex flex-wrap items-center gap-3">
           {/* Status Filter */}
           <div className="flex items-center gap-1.5">
-            <span className="text-xs text-slate-400">Status:</span>
+            <span className="text-xs font-semibold text-[#66645C]">Status:</span>
             <select
               value={selectedStatus}
               onChange={(e) => {
                 setSelectedStatus(e.target.value as ActionStatus | 'all');
                 setPage(1);
               }}
-              className="bg-slate-950 border border-slate-800 text-slate-200 text-xs rounded-lg px-2.5 py-1.5 focus:outline-none focus:border-indigo-500"
+              className="bg-[#F8F7F2] border border-[#DEDDD5] text-[#171714] text-xs font-medium rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-1 focus:ring-[#E5BB45]"
             >
               <option value="all">All Statuses</option>
               <option value="open">Open</option>
@@ -394,14 +535,14 @@ export const ActionCenterDashboard: React.FC = () => {
 
           {/* Priority Filter */}
           <div className="flex items-center gap-1.5">
-            <span className="text-xs text-slate-400">Priority:</span>
+            <span className="text-xs font-semibold text-[#66645C]">Priority:</span>
             <select
               value={selectedPriority}
               onChange={(e) => {
                 setSelectedPriority(e.target.value as ActionPriority | 'all');
                 setPage(1);
               }}
-              className="bg-slate-950 border border-slate-800 text-slate-200 text-xs rounded-lg px-2.5 py-1.5 focus:outline-none focus:border-indigo-500"
+              className="bg-[#F8F7F2] border border-[#DEDDD5] text-[#171714] text-xs font-medium rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-1 focus:ring-[#E5BB45]"
             >
               <option value="all">All Priorities</option>
               <option value="critical">Critical</option>
@@ -413,14 +554,14 @@ export const ActionCenterDashboard: React.FC = () => {
 
           {/* Category Filter */}
           <div className="flex items-center gap-1.5">
-            <span className="text-xs text-slate-400">Category:</span>
+            <span className="text-xs font-semibold text-[#66645C]">Category:</span>
             <select
               value={selectedCategory}
               onChange={(e) => {
                 setSelectedCategory(e.target.value as ActionCategory | 'all');
                 setPage(1);
               }}
-              className="bg-slate-950 border border-slate-800 text-slate-200 text-xs rounded-lg px-2.5 py-1.5 focus:outline-none focus:border-indigo-500"
+              className="bg-[#F8F7F2] border border-[#DEDDD5] text-[#171714] text-xs font-medium rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-1 focus:ring-[#E5BB45]"
             >
               <option value="all">All Categories</option>
               <option value="cash_preservation">Cash Preservation</option>
@@ -429,11 +570,43 @@ export const ActionCenterDashboard: React.FC = () => {
               <option value="vendor_management">Vendor Management</option>
             </select>
           </div>
+
+          {/* Currency Filter */}
+          <div className="flex items-center gap-1.5">
+            <span className="text-xs font-semibold text-[#66645C]">Currency:</span>
+            <select
+              value={selectedCurrency}
+              onChange={(e) => {
+                setSelectedCurrency(e.target.value as SupportedCurrency | 'all');
+                setPage(1);
+              }}
+              className="bg-[#F8F7F2] border border-[#DEDDD5] text-[#171714] text-xs font-medium rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-1 focus:ring-[#E5BB45]"
+            >
+              <option value="all">All Currencies</option>
+              <option value="USD">USD</option>
+              <option value="EUR">EUR</option>
+              <option value="GBP">GBP</option>
+              <option value="CAD">CAD</option>
+              <option value="AUD">AUD</option>
+              <option value="JPY">JPY</option>
+            </select>
+          </div>
+
+          {/* Reset Filters */}
+          {isFilterActive && (
+            <button
+              type="button"
+              onClick={resetFilters}
+              className="px-2.5 py-1.5 text-xs font-semibold text-[#66645C] hover:text-[#171714] hover:bg-[#F8F7F2] rounded-lg transition"
+            >
+              Reset
+            </button>
+          )}
         </div>
 
         {/* Search Bar */}
         <div className="relative w-full sm:w-64">
-          <Search className="w-4 h-4 text-slate-500 absolute left-3 top-2.5" />
+          <Search className="w-4 h-4 text-[#66645C] absolute left-3 top-2.5" />
           <input
             type="text"
             placeholder="Search actions..."
@@ -442,66 +615,81 @@ export const ActionCenterDashboard: React.FC = () => {
               setSearchTerm(e.target.value);
               setPage(1);
             }}
-            className="w-full bg-slate-950 border border-slate-800 text-slate-200 text-xs rounded-lg pl-9 pr-3 py-1.5 focus:outline-none focus:border-indigo-500 placeholder-slate-500"
-          />
+            className="w-full bg-[#F8F7F2] border border-[#DEDDD5] text-[#171714] text-xs rounded-lg pl-9 pr-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-[#E5BB45] placeholder-[#66645C]"
+          ></input>
         </div>
       </div>
 
-      {/* 5. Action Cards List */}
-      <div className="space-y-3">
+      {/* 6. Action Register List */}
+      <div className="space-y-4">
         {isActionsLoading ? (
-          <div className="p-12 text-center text-slate-400 bg-slate-900/20 border border-slate-800/80 rounded-2xl">
-            <RefreshCw className="w-6 h-6 animate-spin mx-auto text-indigo-400 mb-2" />
-            <p className="text-sm">Loading business action recommendations...</p>
+          <div className="p-12 text-center text-[#66645C] bg-white border border-[#DEDDD5] rounded-2xl shadow-2xs">
+            <RefreshCw className="w-6 h-6 animate-spin mx-auto text-[#E5BB45] mb-2" />
+            <p className="text-sm font-semibold text-[#171714]">Loading business actions...</p>
+            <p className="text-xs text-[#66645C] mt-1">
+              Retrieving evidence-backed operational recommendations.
+            </p>
           </div>
         ) : isActionsError ? (
-          <div className="p-8 text-center bg-rose-950/20 border border-rose-900/50 rounded-2xl text-rose-300">
-            <AlertCircle className="w-6 h-6 mx-auto mb-2" />
-            <p className="text-sm font-semibold">Failed to load action items.</p>
+          <div className="p-8 text-center bg-rose-50 border border-rose-200 rounded-2xl text-rose-900 shadow-2xs">
+            <AlertCircle className="w-6 h-6 mx-auto mb-2 text-rose-600" />
+            <p className="text-sm font-bold">Failed to load action items.</p>
+            <p className="text-xs text-rose-700 mt-1">
+              An error occurred while communicating with the actions service.
+            </p>
             <button
               type="button"
               onClick={() => refetchActions()}
-              className="mt-3 px-3 py-1.5 bg-rose-900/50 hover:bg-rose-900 text-xs font-medium rounded-lg transition"
+              className="mt-3 px-4 py-1.5 bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold rounded-lg transition"
             >
               Retry
             </button>
           </div>
         ) : actions.length === 0 ? (
-          <div className="p-12 text-center bg-slate-900/20 border border-slate-800/80 rounded-2xl text-slate-400">
-            <ShieldCheck className="w-8 h-8 text-emerald-400 mx-auto mb-3 opacity-80" />
-            <p className="text-base font-semibold text-white">
+          <div className="p-12 text-center bg-white border border-[#DEDDD5] rounded-2xl text-[#66645C] shadow-2xs">
+            <ShieldCheck className="w-10 h-10 text-emerald-600 mx-auto mb-3 opacity-90" />
+            <p className="text-base font-bold text-[#171714]">
               No actions matching current filters
             </p>
-            <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
+            <p className="text-xs text-[#66645C] mt-1 max-w-md mx-auto leading-relaxed">
               Your financial records and forecasts currently have no active recommendations under
-              the selected criteria.
+              the selected filters.
             </p>
+            {isFilterActive && (
+              <button
+                type="button"
+                onClick={resetFilters}
+                className="mt-4 px-3 py-1.5 text-xs font-bold text-[#171714] bg-[#F8F7F2] border border-[#DEDDD5] rounded-lg hover:bg-[#E8E7E2] transition"
+              >
+                Clear All Filters
+              </button>
+            )}
           </div>
         ) : (
           actions.map((act) => (
             <div
               key={act.id}
-              className="p-5 rounded-2xl bg-slate-900/30 border border-slate-800/80 hover:border-slate-700/80 transition shadow-sm hover:shadow-md flex flex-col md:flex-row items-start md:items-center justify-between gap-4"
+              className="p-5 rounded-2xl bg-white border border-[#DEDDD5] hover:border-[#171714]/40 transition shadow-2xs hover:shadow-xs flex flex-col md:flex-row items-start md:items-center justify-between gap-6"
             >
               <div className="space-y-2 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
                   <span
-                    className={`text-[11px] font-semibold px-2 py-0.5 rounded-full border ${getPriorityBadge(act.priority)}`}
+                    className={`text-[11px] font-bold px-2.5 py-0.5 rounded-full border ${getPriorityBadge(act.priority)}`}
                   >
                     {act.priority.toUpperCase()} ({act.priorityScore} pts)
                   </span>
                   <span
-                    className={`text-[11px] font-medium px-2 py-0.5 rounded-full border ${getCategoryBadge(act.category)}`}
+                    className={`text-[11px] font-semibold px-2.5 py-0.5 rounded-full border ${getCategoryBadge(act.category)}`}
                   >
-                    {act.category.replace('_', ' ')}
+                    {act.category.replace(/_/g, ' ')}
                   </span>
                   <span
-                    className={`text-[11px] font-medium px-2 py-0.5 rounded-full border ${getStatusBadge(act.status)}`}
+                    className={`text-[11px] font-semibold px-2.5 py-0.5 rounded-full border ${getStatusBadge(act.status)}`}
                   >
-                    {act.status.replace('_', ' ')}
+                    {act.status.replace(/_/g, ' ')}
                   </span>
                   {act.currency && act.financialImpact?.potentialExposureMinor > 0 && (
-                    <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-emerald-950/40 text-emerald-300 border border-emerald-800">
+                    <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200">
                       {act.currency}{' '}
                       {formatCurrencyAmount(
                         act.financialImpact.potentialExposureMinor,
@@ -512,29 +700,59 @@ export const ActionCenterDashboard: React.FC = () => {
                   )}
                 </div>
 
-                <h3
-                  className="text-base font-bold text-white hover:text-indigo-300 transition cursor-pointer"
-                  onClick={() => setSelectedActionId(act.id)}
+                <Link
+                  to={`/actions/${act.id}`}
+                  className="text-base font-bold text-[#171714] hover:text-[#D3A82F] transition cursor-pointer inline-block"
                 >
                   {act.title}
-                </h3>
-                <p className="text-xs text-slate-400 line-clamp-2">{act.explanation}</p>
+                </Link>
+                <p className="text-xs text-[#66645C] line-clamp-2 leading-relaxed">
+                  {act.explanation}
+                </p>
 
-                {act.recommendedSteps.length > 0 && (
-                  <div className="flex items-center gap-2 text-xs text-slate-300 bg-slate-950/60 px-3 py-1.5 rounded-lg border border-slate-800/60 w-fit">
-                    <span className="font-semibold text-indigo-400">Step 1:</span>
-                    <span>{act.recommendedSteps[0]!.label}</span>
-                  </div>
-                )}
+                <div className="flex flex-wrap items-center gap-3 pt-1">
+                  {act.recommendedSteps.length > 0 && (
+                    <div className="flex items-center gap-2 text-xs text-[#171714] bg-[#F8F7F2] px-3 py-1.5 rounded-lg border border-[#DEDDD5]">
+                      <span className="font-bold text-[#D3A82F]">Step 1:</span>
+                      <span>{act.recommendedSteps[0]!.label}</span>
+                    </div>
+                  )}
+
+                  {act.sourceFindingIds.length > 0 && (
+                    <div className="flex items-center gap-1.5 text-xs text-[#66645C]">
+                      <span>Source:</span>
+                      {act.sourceFindingIds.slice(0, 2).map((findId) => (
+                        <Link
+                          key={findId}
+                          to={`/findings/${findId}`}
+                          className="inline-flex items-center gap-1 font-semibold text-[#171714] hover:text-[#D3A82F] hover:underline"
+                        >
+                          <span>Finding {findId.slice(0, 8)}...</span>
+                          <ArrowRight className="w-3 h-3 text-[#E5BB45]" />
+                        </Link>
+                      ))}
+                    </div>
+                  )}
+
+                  {act.sourceForecastRunId && (
+                    <Link
+                      to="/cash-flow"
+                      className="inline-flex items-center gap-1 text-xs font-semibold text-[#171714] hover:text-[#D3A82F] hover:underline"
+                    >
+                      <span>Linked Forecast Run</span>
+                      <ArrowRight className="w-3 h-3 text-[#E5BB45]" />
+                    </Link>
+                  )}
+                </div>
               </div>
 
-              {/* Action Buttons */}
-              <div className="flex flex-wrap items-center gap-2 self-end md:self-center">
+              {/* State-Aware Action Buttons */}
+              <div className="flex flex-wrap items-center gap-2 self-end md:self-center shrink-0">
                 {act.status === 'open' && (
                   <button
                     type="button"
                     onClick={() => openTransitionDialog(act, 'in_progress')}
-                    className="px-3 py-1.5 text-xs font-semibold text-white bg-indigo-600/80 hover:bg-indigo-600 rounded-lg transition cursor-pointer"
+                    className="px-3.5 py-1.5 text-xs font-bold text-white bg-[#171714] hover:bg-[#2A2A26] rounded-xl transition cursor-pointer shadow-2xs"
                   >
                     Start Action
                   </button>
@@ -544,7 +762,7 @@ export const ActionCenterDashboard: React.FC = () => {
                   <button
                     type="button"
                     onClick={() => openTransitionDialog(act, 'completed')}
-                    className="px-3 py-1.5 text-xs font-semibold text-white bg-emerald-600/80 hover:bg-emerald-600 rounded-lg transition cursor-pointer"
+                    className="px-3.5 py-1.5 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-xl transition cursor-pointer shadow-2xs"
                   >
                     Mark Done
                   </button>
@@ -555,14 +773,14 @@ export const ActionCenterDashboard: React.FC = () => {
                     <button
                       type="button"
                       onClick={() => openTransitionDialog(act, 'snoozed')}
-                      className="px-2.5 py-1.5 text-xs text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 rounded-lg transition cursor-pointer"
+                      className="px-3 py-1.5 text-xs font-semibold text-[#66645C] hover:text-[#171714] bg-[#F8F7F2] hover:bg-[#E8E7E2] border border-[#DEDDD5] rounded-xl transition cursor-pointer"
                     >
                       Snooze
                     </button>
                     <button
                       type="button"
                       onClick={() => openTransitionDialog(act, 'dismissed')}
-                      className="px-2.5 py-1.5 text-xs text-slate-400 hover:text-rose-300 bg-slate-800/60 hover:bg-rose-950/40 rounded-lg transition cursor-pointer"
+                      className="px-3 py-1.5 text-xs font-semibold text-rose-700 hover:text-rose-900 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-xl transition cursor-pointer"
                     >
                       Dismiss
                     </button>
@@ -573,9 +791,9 @@ export const ActionCenterDashboard: React.FC = () => {
                   <button
                     type="button"
                     onClick={() => openTransitionDialog(act, 'open')}
-                    className="px-2.5 py-1.5 text-xs text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 rounded-lg transition cursor-pointer flex items-center gap-1"
+                    className="px-3 py-1.5 text-xs font-bold text-[#171714] hover:text-black bg-[#F8F7F2] hover:bg-[#E8E7E2] border border-[#DEDDD5] rounded-xl transition cursor-pointer flex items-center gap-1.5"
                   >
-                    <RotateCcw className="w-3 h-3" />
+                    <RotateCcw className="w-3.5 h-3.5" />
                     <span>Reopen</span>
                   </button>
                 )}
@@ -583,7 +801,7 @@ export const ActionCenterDashboard: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => setSelectedActionId(act.id)}
-                  className="px-2.5 py-1.5 text-xs font-medium text-slate-400 hover:text-white border border-slate-700/80 hover:border-slate-600 rounded-lg transition cursor-pointer"
+                  className="px-3 py-1.5 text-xs font-bold text-[#171714] hover:bg-[#F8F7F2] border border-[#DEDDD5] rounded-xl transition cursor-pointer"
                 >
                   Details
                 </button>
@@ -593,9 +811,9 @@ export const ActionCenterDashboard: React.FC = () => {
         )}
       </div>
 
-      {/* 6. Pagination Controls */}
+      {/* 7. Pagination Controls */}
       {pagination && pagination.totalPages > 1 && (
-        <div className="flex items-center justify-between text-xs text-slate-400 p-2">
+        <div className="flex items-center justify-between text-xs text-[#66645C] p-3 bg-white border border-[#DEDDD5] rounded-xl shadow-2xs">
           <span>
             Page {pagination.page} of {pagination.totalPages} ({pagination.totalItems} total
             actions)
@@ -605,52 +823,63 @@ export const ActionCenterDashboard: React.FC = () => {
               type="button"
               disabled={pagination.page <= 1}
               onClick={() => setPage((prev) => Math.max(1, prev - 1))}
-              className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 hover:bg-slate-800 disabled:opacity-40 transition cursor-pointer"
+              className="p-2 rounded-lg bg-[#F8F7F2] border border-[#DEDDD5] hover:bg-[#E8E7E2] disabled:opacity-40 transition cursor-pointer"
             >
-              <ChevronLeft className="w-4 h-4" />
+              <ChevronLeft className="w-4 h-4 text-[#171714]" />
             </button>
             <button
               type="button"
               disabled={pagination.page >= pagination.totalPages}
               onClick={() => setPage((prev) => prev + 1)}
-              className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 hover:bg-slate-800 disabled:opacity-40 transition cursor-pointer"
+              className="p-2 rounded-lg bg-[#F8F7F2] border border-[#DEDDD5] hover:bg-[#E8E7E2] disabled:opacity-40 transition cursor-pointer"
             >
-              <ChevronRight className="w-4 h-4" />
+              <ChevronRight className="w-4 h-4 text-[#171714]" />
             </button>
           </div>
         </div>
       )}
 
-      {/* 7. Action Detail Modal */}
+      {/* 8. Action Detail & Evidence Modal */}
       {selectedActionId && detail && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-200">
-          <div className="bg-slate-900 border border-slate-800 rounded-3xl max-w-2xl w-full max-h-[90vh] flex flex-col shadow-2xl overflow-hidden">
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="action-detail-title"
+          className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/50 backdrop-blur-xs animate-in fade-in duration-200"
+        >
+          <div className="bg-white border border-[#DEDDD5] rounded-2xl max-w-2xl w-full max-h-[90vh] flex flex-col shadow-xl overflow-hidden">
             {/* Modal Header */}
-            <div className="p-6 border-b border-slate-800 flex items-start justify-between gap-4">
+            <div className="p-4 sm:p-6 border-b border-[#DEDDD5] flex items-start justify-between gap-4 bg-[#F8F7F2]">
               <div className="space-y-1">
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
                   <span
-                    className={`text-[11px] font-semibold px-2 py-0.5 rounded-full border ${getPriorityBadge(detail.priority)}`}
+                    className={`text-[11px] font-bold px-2.5 py-0.5 rounded-full border ${getPriorityBadge(detail.priority)}`}
                   >
                     {detail.priority.toUpperCase()} ({detail.priorityScore} pts)
                   </span>
                   <span
-                    className={`text-[11px] font-medium px-2 py-0.5 rounded-full border ${getCategoryBadge(detail.category)}`}
+                    className={`text-[11px] font-semibold px-2.5 py-0.5 rounded-full border ${getCategoryBadge(detail.category)}`}
                   >
-                    {detail.category}
+                    {detail.category.replace(/_/g, ' ')}
                   </span>
                   <span
-                    className={`text-[11px] font-medium px-2 py-0.5 rounded-full border ${getStatusBadge(detail.status)}`}
+                    className={`text-[11px] font-semibold px-2.5 py-0.5 rounded-full border ${getStatusBadge(detail.status)}`}
                   >
-                    {detail.status}
+                    {detail.status.replace(/_/g, ' ')}
                   </span>
                 </div>
-                <h2 className="text-lg font-bold text-white mt-2">{detail.title}</h2>
+                <h2
+                  id="action-detail-title"
+                  className="font-serif text-lg sm:text-xl font-bold text-[#171714] mt-2"
+                >
+                  {detail.title}
+                </h2>
               </div>
               <button
                 type="button"
                 onClick={() => setSelectedActionId(null)}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition"
+                className="w-10 h-10 flex items-center justify-center rounded-xl text-[#66645C] hover:text-[#171714] hover:bg-[#E8E7E2] transition shrink-0"
+                aria-label="Close dialog"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -660,10 +889,12 @@ export const ActionCenterDashboard: React.FC = () => {
             <div className="p-6 space-y-6 overflow-y-auto">
               {/* Financial Impact Box */}
               {detail.currency && (
-                <div className="p-4 rounded-xl bg-slate-950 border border-slate-800/80 grid grid-cols-2 sm:grid-cols-3 gap-3">
+                <div className="p-4 rounded-xl bg-[#F8F7F2] border border-[#DEDDD5] grid grid-cols-2 sm:grid-cols-3 gap-4">
                   <div>
-                    <span className="text-[11px] text-slate-400">Potential Exposure</span>
-                    <p className="text-sm font-bold text-white mt-0.5">
+                    <span className="text-[11px] font-semibold text-[#66645C]">
+                      Potential Exposure
+                    </span>
+                    <p className="text-sm font-bold text-[#171714] mt-0.5">
                       {detail.currency}{' '}
                       {formatCurrencyAmount(
                         detail.financialImpact.potentialExposureMinor,
@@ -672,8 +903,10 @@ export const ActionCenterDashboard: React.FC = () => {
                     </p>
                   </div>
                   <div>
-                    <span className="text-[11px] text-slate-400">Estimated Avoidable</span>
-                    <p className="text-sm font-bold text-emerald-400 mt-0.5">
+                    <span className="text-[11px] font-semibold text-[#66645C]">
+                      Estimated Avoidable
+                    </span>
+                    <p className="text-sm font-bold text-emerald-700 mt-0.5">
                       {detail.currency}{' '}
                       {formatCurrencyAmount(
                         detail.financialImpact.estimatedAvoidableCostMinor,
@@ -683,8 +916,10 @@ export const ActionCenterDashboard: React.FC = () => {
                   </div>
                   {detail.financialImpact.projectedCashFlowEffectMinor !== 0 && (
                     <div>
-                      <span className="text-[11px] text-slate-400">Net Flow Effect</span>
-                      <p className="text-sm font-bold text-sky-400 mt-0.5">
+                      <span className="text-[11px] font-semibold text-[#66645C]">
+                        Net Flow Effect
+                      </span>
+                      <p className="text-sm font-bold text-sky-700 mt-0.5">
                         {detail.currency}{' '}
                         {formatCurrencyAmount(
                           detail.financialImpact.projectedCashFlowEffectMinor,
@@ -698,10 +933,10 @@ export const ActionCenterDashboard: React.FC = () => {
 
               {/* Rationale & Explanation */}
               <div>
-                <h4 className="text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">
+                <h4 className="text-xs font-bold text-[#171714] uppercase tracking-wider mb-2">
                   Why This Action Was Generated
                 </h4>
-                <p className="text-sm text-slate-300 leading-relaxed bg-slate-950/40 p-3.5 rounded-xl border border-slate-800/50">
+                <p className="text-xs text-[#171714] leading-relaxed bg-[#F8F7F2] p-4 rounded-xl border border-[#DEDDD5]">
                   {detail.explanation}
                 </p>
               </div>
@@ -709,26 +944,26 @@ export const ActionCenterDashboard: React.FC = () => {
               {/* Recommended Action Steps */}
               {detail.recommendedSteps.length > 0 && (
                 <div>
-                  <h4 className="text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">
+                  <h4 className="text-xs font-bold text-[#171714] uppercase tracking-wider mb-2">
                     Recommended Next Steps
                   </h4>
                   <div className="space-y-2">
                     {detail.recommendedSteps.map((step) => (
                       <div
                         key={step.stepNumber}
-                        className="p-3 rounded-xl bg-slate-950/60 border border-slate-800/60 flex items-start gap-3"
+                        className="p-3 rounded-xl bg-white border border-[#DEDDD5] flex items-start gap-3"
                       >
-                        <span className="w-5 h-5 rounded-full bg-indigo-950 text-indigo-400 border border-indigo-800 text-xs font-bold flex items-center justify-center shrink-0">
+                        <span className="w-5 h-5 rounded-full bg-[#171714] text-[#E5BB45] text-xs font-bold flex items-center justify-center shrink-0">
                           {step.stepNumber}
                         </span>
                         <div>
-                          <div className="text-xs font-semibold text-white">
+                          <div className="text-xs font-bold text-[#171714]">
                             {step.label}{' '}
                             {step.isOptional && (
-                              <span className="text-slate-500 font-normal">(Optional)</span>
+                              <span className="text-[#66645C] font-normal">(Optional)</span>
                             )}
                           </div>
-                          <div className="text-xs text-slate-400 mt-0.5">{step.description}</div>
+                          <div className="text-xs text-[#66645C] mt-0.5">{step.description}</div>
                         </div>
                       </div>
                     ))}
@@ -736,41 +971,71 @@ export const ActionCenterDashboard: React.FC = () => {
                 </div>
               )}
 
+              {/* Linked Records Navigation */}
+              {(detail.sourceFindingIds.length > 0 || detail.sourceForecastRunId) && (
+                <div>
+                  <h4 className="text-xs font-bold text-[#171714] uppercase tracking-wider mb-2">
+                    Linked Source Records
+                  </h4>
+                  <div className="flex flex-wrap gap-2">
+                    {detail.sourceFindingIds.map((findId) => (
+                      <Link
+                        key={findId}
+                        to={`/findings/${findId}`}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#F8F7F2] border border-[#DEDDD5] text-xs font-semibold text-[#171714] hover:bg-[#E8E7E2] transition"
+                      >
+                        <span>Finding: {findId}</span>
+                        <ExternalLink className="w-3 h-3 text-[#E5BB45]" />
+                      </Link>
+                    ))}
+                    {detail.sourceForecastRunId && (
+                      <Link
+                        to="/cash-flow"
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#F8F7F2] border border-[#DEDDD5] text-xs font-semibold text-[#171714] hover:bg-[#E8E7E2] transition"
+                      >
+                        <span>Cash Flow Forecast Workspace</span>
+                        <ExternalLink className="w-3 h-3 text-[#E5BB45]" />
+                      </Link>
+                    )}
+                  </div>
+                </div>
+              )}
+
               {/* Underlying Evidence */}
               <div>
-                <h4 className="text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">
+                <h4 className="text-xs font-bold text-[#171714] uppercase tracking-wider mb-2">
                   Underlying Source Evidence
                 </h4>
-                <div className="p-3 rounded-xl bg-slate-950 text-slate-400 text-xs font-mono overflow-x-auto max-h-40 border border-slate-800/80">
+                <div className="p-3 rounded-xl bg-[#F8F7F2] text-[#171714] text-xs font-mono overflow-x-auto max-h-40 border border-[#DEDDD5]">
                   <pre>{JSON.stringify(detail.evidence, null, 2)}</pre>
                 </div>
               </div>
 
               {/* Audit History Trail */}
               <div>
-                <h4 className="text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2 flex items-center gap-1.5">
-                  <History className="w-3.5 h-3.5 text-indigo-400" />
+                <h4 className="text-xs font-bold text-[#171714] uppercase tracking-wider mb-2 flex items-center gap-1.5">
+                  <History className="w-3.5 h-3.5 text-[#E5BB45]" />
                   <span>Lifecycle History (Append-Only Audit Trail)</span>
                 </h4>
                 {isHistoryLoading ? (
-                  <p className="text-xs text-slate-500">Loading audit trail...</p>
+                  <p className="text-xs text-[#66645C]">Loading audit trail...</p>
                 ) : history.length === 0 ? (
-                  <p className="text-xs text-slate-500">No events recorded yet.</p>
+                  <p className="text-xs text-[#66645C]">No events recorded yet.</p>
                 ) : (
-                  <div className="space-y-2 border-l-2 border-slate-800 pl-3 ml-1.5">
+                  <div className="space-y-2 border-l-2 border-[#DEDDD5] pl-3 ml-1.5">
                     {history.map((event) => (
                       <div key={event.id} className="text-xs space-y-0.5">
-                        <div className="text-slate-400">
-                          <span className="font-semibold text-white">{event.eventType}</span> &rarr;{' '}
-                          <span className="text-indigo-400">{event.nextStatus}</span>
-                          <span className="text-slate-500 ml-2">
+                        <div className="text-[#66645C]">
+                          <span className="font-bold text-[#171714]">{event.eventType}</span> &rarr;{' '}
+                          <span className="font-semibold text-blue-700">{event.nextStatus}</span>
+                          <span className="text-[#66645C] ml-2">
                             {new Date(event.createdAt).toLocaleString()}
                           </span>
                         </div>
                         {event.reason && (
-                          <p className="text-slate-400 italic">Reason: {event.reason}</p>
+                          <p className="text-[#66645C] italic">Reason: {event.reason}</p>
                         )}
-                        {event.notes && <p className="text-slate-400">Notes: {event.notes}</p>}
+                        {event.notes && <p className="text-[#66645C]">Notes: {event.notes}</p>}
                       </div>
                     ))}
                   </div>
@@ -779,27 +1044,44 @@ export const ActionCenterDashboard: React.FC = () => {
             </div>
 
             {/* Modal Footer Controls */}
-            <div className="p-4 border-t border-slate-800 flex items-center justify-between bg-slate-950">
-              <div className="text-xs text-slate-500">
+            <div className="p-4 border-t border-[#DEDDD5] flex items-center justify-between bg-[#F8F7F2]">
+              <div className="text-xs text-[#66645C]">
                 Rule: {detail.ruleId} ({detail.ruleVersion})
               </div>
-              <button
-                type="button"
-                onClick={() => setSelectedActionId(null)}
-                className="px-4 py-2 text-xs font-medium text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 rounded-xl transition"
-              >
-                Close
-              </button>
+              <div className="flex items-center gap-2">
+                <Link
+                  to={`/actions/${detail.id}`}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-white bg-[#171714] hover:bg-[#2A2A26] rounded-xl transition shadow-2xs"
+                >
+                  <span>Full Details &amp; History</span>
+                  <ExternalLink className="w-3.5 h-3.5" />
+                </Link>
+                <button
+                  type="button"
+                  onClick={() => setSelectedActionId(null)}
+                  className="px-4 py-2 text-xs font-bold text-[#171714] bg-white border border-[#DEDDD5] hover:bg-[#E8E7E2] rounded-xl transition cursor-pointer"
+                >
+                  Close
+                </button>
+              </div>
             </div>
           </div>
         </div>
       )}
 
-      {/* 8. Transition Action Dialog */}
+      {/* 9. Transition Action Dialog */}
       {transitionAction && targetStatus && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-200">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4">
-            <h3 className="text-base font-bold text-white">
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="transition-dialog-title"
+          className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/50 backdrop-blur-xs animate-in fade-in duration-200"
+        >
+          <div className="bg-white border border-[#DEDDD5] rounded-2xl max-w-md w-full p-5 sm:p-6 shadow-xl space-y-4 max-h-[90vh] overflow-y-auto">
+            <h3
+              id="transition-dialog-title"
+              className="font-serif text-lg font-bold text-[#171714]"
+            >
               {targetStatus === 'dismissed' && 'Dismiss Recommendation'}
               {targetStatus === 'completed' && 'Mark Action Completed'}
               {targetStatus === 'snoozed' && 'Snooze Action'}
@@ -807,11 +1089,11 @@ export const ActionCenterDashboard: React.FC = () => {
               {targetStatus === 'open' && 'Reopen Action'}
             </h3>
 
-            <p className="text-xs text-slate-400">
+            <p className="text-xs text-[#66645C] leading-relaxed">
               {targetStatus === 'dismissed' &&
                 'Please provide a non-empty reason explaining why this recommendation is not applicable or has been dismissed.'}
               {targetStatus === 'completed' &&
-                'Record resolution notes for your team (optional). Marking completed records your action, but does not claim verified monetary recovery.'}
+                'Record resolution notes for your team (optional). Marking completed records your action, but does not claim verified monetary recovery without bank confirmation.'}
               {targetStatus === 'snoozed' &&
                 'Select how long to defer this action before it automatically re-evaluates and reopens.'}
               {targetStatus === 'in_progress' &&
@@ -821,22 +1103,22 @@ export const ActionCenterDashboard: React.FC = () => {
 
             {targetStatus === 'dismissed' && (
               <div>
-                <label className="block text-xs font-medium text-slate-300 mb-1">
-                  Dismissal Reason <span className="text-rose-400">*</span>
+                <label className="block text-xs font-bold text-[#171714] mb-1">
+                  Dismissal Reason <span className="text-rose-600">*</span>
                 </label>
                 <textarea
                   rows={3}
                   value={dismissalReason}
                   onChange={(e) => setDismissalReason(e.target.value)}
                   placeholder="e.g., Authorized annual software license expansion confirmed by store manager."
-                  className="w-full bg-slate-950 border border-slate-800 text-slate-200 text-xs rounded-lg p-2.5 focus:outline-none focus:border-indigo-500"
+                  className="w-full bg-[#F8F7F2] border border-[#DEDDD5] text-[#171714] text-xs rounded-xl p-2.5 focus:outline-none focus:ring-1 focus:ring-[#E5BB45]"
                 />
               </div>
             )}
 
             {targetStatus === 'completed' && (
               <div>
-                <label className="block text-xs font-medium text-slate-300 mb-1">
+                <label className="block text-xs font-bold text-[#171714] mb-1">
                   Completion Notes (Optional)
                 </label>
                 <textarea
@@ -844,20 +1126,20 @@ export const ActionCenterDashboard: React.FC = () => {
                   value={completionNotes}
                   onChange={(e) => setCompletionNotes(e.target.value)}
                   placeholder="e.g., Contacted vendor billing; credit note #992 received for next month statement."
-                  className="w-full bg-slate-950 border border-slate-800 text-slate-200 text-xs rounded-lg p-2.5 focus:outline-none focus:border-indigo-500"
+                  className="w-full bg-[#F8F7F2] border border-[#DEDDD5] text-[#171714] text-xs rounded-xl p-2.5 focus:outline-none focus:ring-1 focus:ring-[#E5BB45]"
                 />
               </div>
             )}
 
             {targetStatus === 'snoozed' && (
               <div>
-                <label className="block text-xs font-medium text-slate-300 mb-1">
+                <label className="block text-xs font-bold text-[#171714] mb-1">
                   Snooze Duration
                 </label>
                 <select
                   value={snoozeDays}
                   onChange={(e) => setSnoozeDays(Number(e.target.value))}
-                  className="w-full bg-slate-950 border border-slate-800 text-slate-200 text-xs rounded-lg p-2.5 focus:outline-none focus:border-indigo-500"
+                  className="w-full bg-[#F8F7F2] border border-[#DEDDD5] text-[#171714] text-xs rounded-xl p-2.5 focus:outline-none focus:ring-1 focus:ring-[#E5BB45]"
                 >
                   <option value={1}>1 Day (Tomorrow)</option>
                   <option value={3}>3 Days</option>
@@ -869,7 +1151,7 @@ export const ActionCenterDashboard: React.FC = () => {
             )}
 
             {transitionError && (
-              <p className="text-xs text-rose-400 font-medium">{transitionError}</p>
+              <p className="text-xs text-rose-600 font-bold">{transitionError}</p>
             )}
 
             <div className="flex items-center justify-end gap-3 pt-2">
@@ -877,7 +1159,7 @@ export const ActionCenterDashboard: React.FC = () => {
                 type="button"
                 onClick={closeTransitionDialog}
                 disabled={transitionMutation.isPending}
-                className="px-3 py-1.5 text-xs text-slate-400 hover:text-white rounded-lg transition"
+                className="px-3.5 py-1.5 text-xs font-semibold text-[#66645C] hover:text-[#171714] rounded-xl transition"
               >
                 Cancel
               </button>
@@ -885,7 +1167,7 @@ export const ActionCenterDashboard: React.FC = () => {
                 type="button"
                 onClick={submitTransition}
                 disabled={transitionMutation.isPending}
-                className="px-4 py-1.5 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg transition disabled:opacity-50"
+                className="px-4 py-1.5 text-xs font-bold text-white bg-[#171714] hover:bg-[#2A2A26] rounded-xl transition disabled:opacity-50 cursor-pointer shadow-2xs"
               >
                 {transitionMutation.isPending ? 'Updating...' : 'Confirm'}
               </button>
@@ -895,4 +1177,10 @@ export const ActionCenterDashboard: React.FC = () => {
       )}
     </div>
   );
+
+  if (!inShell) {
+    return bodyContent;
+  }
+
+  return <Layout pageTitle="Action Center">{bodyContent}</Layout>;
 };

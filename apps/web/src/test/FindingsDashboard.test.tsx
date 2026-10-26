@@ -1,12 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { MemoryRouter } from 'react-router-dom';
 import { FindingsDashboard } from '../components/FindingsDashboard';
 import * as financialServiceModule from '../services/financial.service';
 import type {
   FinancialFinding,
   FinancialExposureSummary,
   FindingListResponse,
+  AiExplanation,
 } from '@moneylens/shared';
 
 describe('FindingsDashboard Component Suite', () => {
@@ -75,6 +77,20 @@ describe('FindingsDashboard Component Suite', () => {
     },
   };
 
+  const mockAiExplanation: AiExplanation = {
+    findingId: 'finding-101',
+    organizationId: 'org-test',
+    summary: 'Two identical payments of USD 75.00 were processed for ACME WHOLESALE.',
+    whyItWasFlagged: 'Invoice INV-7711 was billed twice within 24 hours.',
+    evidenceSummary:
+      'Primary tx-1 and secondary tx-2 share identical minor unit amounts and references.',
+    recommendedChecks: ['Verify invoice with ACME accounts payable.'],
+    limitations: ['Batch imports from multiple accounts can cause temporary apparent duplicates.'],
+    generatedAt: '2026-03-15T10:05:00.000Z',
+    provider: 'deterministic_rule_engine',
+    model: 'rule-explainer-v1',
+  };
+
   beforeEach(() => {
     vi.restoreAllMocks();
     queryClient = new QueryClient({
@@ -125,13 +141,35 @@ describe('FindingsDashboard Component Suite', () => {
         },
       ],
     });
+
+    vi.spyOn(financialServiceModule.financialService, 'explainFinding').mockResolvedValue(
+      mockAiExplanation,
+    );
+
+    vi.spyOn(financialServiceModule.financialService, 'triggerDetectionRun').mockResolvedValue({
+      id: 'run-101',
+      organizationId: 'org-test',
+      ruleVersion: 'v1.0.0',
+      status: 'completed',
+      startedAt: '2026-03-15T12:00:00.000Z',
+      completedAt: '2026-03-15T12:00:05.000Z',
+      transactionsEvaluated: 150,
+      findingsCreated: 2,
+      findingsUpdated: 1,
+      findingsUnchanged: 1,
+      errors: [],
+      createdAt: '2026-03-15T12:00:00.000Z',
+      updatedAt: '2026-03-15T12:00:05.000Z',
+    });
   });
 
   const renderComponent = () => {
     return render(
-      <QueryClientProvider client={queryClient}>
-        <FindingsDashboard />
-      </QueryClientProvider>,
+      <MemoryRouter>
+        <QueryClientProvider client={queryClient}>
+          <FindingsDashboard />
+        </QueryClientProvider>
+      </MemoryRouter>,
     );
   };
 
@@ -151,16 +189,16 @@ describe('FindingsDashboard Component Suite', () => {
   it('renders findings table with severity badge, title, and inspect button', async () => {
     renderComponent();
 
-    const inspectBtn = await screen.findByRole('button', { name: /Inspect/i });
-    expect(inspectBtn).toBeInTheDocument();
+    const inspectBtns = await screen.findAllByRole('button', { name: /Inspect/i });
+    expect(inspectBtns[0]).toBeInTheDocument();
     expect(screen.getAllByText(/Potential Duplicate Payment/i).length).toBeGreaterThanOrEqual(1);
   });
 
   it('opens detail modal upon clicking Inspect, showing evidence and transactions', async () => {
     renderComponent();
 
-    const inspectBtn = await screen.findByRole('button', { name: /Inspect/i });
-    fireEvent.click(inspectBtn);
+    const inspectBtns = await screen.findAllByRole('button', { name: /Inspect/i });
+    fireEvent.click(inspectBtns[0]!);
 
     await waitFor(() => {
       expect(screen.getByText(/Detection Evidence/i)).toBeInTheDocument();
@@ -180,8 +218,8 @@ describe('FindingsDashboard Component Suite', () => {
 
     renderComponent();
 
-    const inspectBtn = await screen.findByRole('button', { name: /Inspect/i });
-    fireEvent.click(inspectBtn);
+    const inspectBtns = await screen.findAllByRole('button', { name: /Inspect/i });
+    fireEvent.click(inspectBtns[0]!);
 
     const startReviewBtn = await screen.findByRole('button', { name: /Start Review/i });
     fireEvent.click(startReviewBtn);
@@ -197,8 +235,8 @@ describe('FindingsDashboard Component Suite', () => {
   it('requires a dismissal reason when dismissing a finding', async () => {
     renderComponent();
 
-    const inspectBtn = await screen.findByRole('button', { name: /Inspect/i });
-    fireEvent.click(inspectBtn);
+    const inspectBtns = await screen.findAllByRole('button', { name: /Inspect/i });
+    fireEvent.click(inspectBtns[0]!);
 
     const dismissBtn = await screen.findByRole('button', { name: /Dismiss Finding/i });
     fireEvent.click(dismissBtn);
@@ -207,5 +245,74 @@ describe('FindingsDashboard Component Suite', () => {
     fireEvent.click(submitBtn);
 
     expect(screen.getByText(/A dismissal reason is required/i)).toBeInTheDocument();
+  });
+
+  it('triggers explainFinding mutation and displays AI summary and recommendations', async () => {
+    renderComponent();
+
+    const inspectBtns = await screen.findAllByRole('button', { name: /Inspect/i });
+    fireEvent.click(inspectBtns[0]!);
+
+    const explainBtn = await screen.findByRole('button', { name: /Explain Finding/i });
+    fireEvent.click(explainBtn);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Two identical payments of USD 75.00/i)).toBeInTheDocument();
+      expect(
+        screen.getByText(/Invoice INV-7711 was billed twice within 24 hours/i),
+      ).toBeInTheDocument();
+      expect(screen.getByText(/Verify invoice with ACME accounts payable/i)).toBeInTheDocument();
+    });
+  });
+
+  it('allows opening scan modal and triggering bounded detection run', async () => {
+    const triggerSpy = vi.spyOn(financialServiceModule.financialService, 'triggerDetectionRun');
+
+    renderComponent();
+
+    const scanBtn = screen.getByRole('button', { name: /Run Leakage Scan/i });
+    fireEvent.click(scanBtn);
+
+    expect(screen.getByText(/Run Financial Leakage Scan/i)).toBeInTheDocument();
+
+    const startEvalBtn = screen.getByRole('button', { name: /Start Evaluation/i });
+    fireEvent.click(startEvalBtn);
+
+    await waitFor(() => {
+      expect(triggerSpy).toHaveBeenCalled();
+    });
+  });
+
+  it('handles empty findings and renders reset filters when filtered', async () => {
+    vi.spyOn(financialServiceModule.financialService, 'getFindings').mockResolvedValue({
+      items: [],
+      pagination: {
+        page: 1,
+        limit: 20,
+        totalItems: 0,
+        totalPages: 0,
+      },
+    });
+
+    renderComponent();
+
+    // Select a status filter
+    const underReviewTab = screen.getByRole('button', { name: /under review/i });
+    fireEvent.click(underReviewTab);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/No findings match the current filter criteria/i),
+      ).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Reset All Filters/i })).toBeInTheDocument();
+    });
+
+    // Reset filters
+    const resetBtn = screen.getByRole('button', { name: /Reset All Filters/i });
+    fireEvent.click(resetBtn);
+
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: /Reset All Filters/i })).not.toBeInTheDocument();
+    });
   });
 });

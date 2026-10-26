@@ -53,6 +53,16 @@ Thumbs.db
 
 # Vitest and Vite
 .vite/
+playwright-report/
+test-results/
+blob-report/
 
-# Agent / Tooling temporary folders
+# Agent, Tooling, and AI Test Artifacts
 .system_generated/
+.tempmediaStorage/
+.user_uploaded/
+.agents/
+.gemini/
+scratch/
+*.webm
+*.webp

@@ -3,8 +3,11 @@
 @tailwind utilities;
 
 @layer base {
+  html {
+    scroll-behavior: smooth;
+  }
   body {
-    @apply bg-slate-950 text-slate-100;
+    @apply bg-ml-soft-white text-ml-text-primary antialiased;
     font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
   }
 }

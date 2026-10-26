@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { MemoryRouter } from 'react-router-dom';
 import { ActionCenterDashboard } from '../components/ActionCenterDashboard';
 import { financialService } from '../services/financial.service';
 import type {
@@ -155,7 +156,9 @@ describe('ActionCenterDashboard Component Suite', () => {
   const renderComponent = () => {
     return render(
       <QueryClientProvider client={queryClient}>
-        <ActionCenterDashboard />
+        <MemoryRouter>
+          <ActionCenterDashboard />
+        </MemoryRouter>
       </QueryClientProvider>,
     );
   };
@@ -164,7 +167,6 @@ describe('ActionCenterDashboard Component Suite', () => {
     renderComponent();
 
     expect(await screen.findByText('Business Action Center')).toBeInTheDocument();
-    // Critical & High card and Open Tasks card both display 3
     expect(screen.getByText('Critical & High')).toBeInTheDocument();
     const countElements = await screen.findAllByText('3');
     expect(countElements.length).toBeGreaterThanOrEqual(1);
@@ -259,5 +261,45 @@ describe('ActionCenterDashboard Component Suite', () => {
     await waitFor(() => {
       expect(financialService.evaluateActions).toHaveBeenCalled();
     });
+  });
+
+  it('handles Snooze action transition with duration deadline', async () => {
+    renderComponent();
+
+    const snoozeBtn = await screen.findByRole('button', { name: /Snooze/i });
+    fireEvent.click(snoozeBtn);
+
+    expect(await screen.findByText('Snooze Action')).toBeInTheDocument();
+    expect(screen.getByText('Snooze Duration')).toBeInTheDocument();
+
+    const confirmBtn = screen.getByRole('button', { name: /Confirm/i });
+    fireEvent.click(confirmBtn);
+
+    await waitFor(() => {
+      expect(financialService.transitionAction).toHaveBeenCalledWith(
+        'act-101',
+        expect.objectContaining({
+          status: 'snoozed',
+          snoozedUntil: expect.any(String),
+        }),
+      );
+    });
+  });
+
+  it('renders empty state when zero actions match filters', async () => {
+    vi.spyOn(financialService, 'getActions').mockResolvedValue({
+      items: [],
+      pagination: { page: 1, limit: 15, totalItems: 0, totalPages: 1 },
+    });
+
+    renderComponent();
+
+    expect(await screen.findByText('No actions matching current filters')).toBeInTheDocument();
+  });
+
+  it('renders direct navigation link to source finding record', async () => {
+    renderComponent();
+
+    expect(await screen.findByText(/Finding find-dup\.\.\./)).toBeInTheDocument();
   });
 });

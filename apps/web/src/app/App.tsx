@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
+import { useSearchParams, Link } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { healthService } from '../services/health.service';
 import { financialService } from '../services/financial.service';
@@ -30,12 +31,50 @@ import {
   Activity,
   ArrowLeftRight,
   ShieldAlert,
+  LayoutDashboard,
 } from 'lucide-react';
 
-export const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<
-    'ingestion' | 'reconciliation' | 'findings' | 'cash-flow' | 'actions' | 'telemetry'
-  >('ingestion');
+export interface AppProps {
+  initialTab?: 'ingestion' | 'reconciliation' | 'findings' | 'cash-flow' | 'actions' | 'telemetry';
+}
+
+export const App: React.FC<AppProps> = ({ initialTab: propInitialTab }) => {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const validTabs = [
+    'ingestion',
+    'reconciliation',
+    'findings',
+    'cash-flow',
+    'actions',
+    'telemetry',
+  ] as const;
+  type TabType = (typeof validTabs)[number];
+
+  const tabParam = searchParams.get('tab') as TabType | null;
+  const initialTab =
+    tabParam && validTabs.includes(tabParam)
+      ? tabParam
+      : propInitialTab && validTabs.includes(propInitialTab)
+        ? propInitialTab
+        : 'ingestion';
+
+  const [activeTab, setActiveTabState] = useState<TabType>(initialTab);
+
+  useEffect(() => {
+    if (tabParam && validTabs.includes(tabParam) && tabParam !== activeTab) {
+      setActiveTabState(tabParam);
+    }
+  }, [tabParam, activeTab]);
+
+  const setActiveTab = (tab: TabType) => {
+    setActiveTabState(tab);
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.set('tab', tab);
+      return next;
+    });
+  };
+
   const [latestJob, setLatestJob] = useState<ImportJob | null>(null);
   const [isErrorsOpen, setIsErrorsOpen] = useState(false);
   const [refreshTrigger, setRefreshTrigger] = useState(0);
@@ -127,11 +166,19 @@ export const App: React.FC = () => {
       </section>
 
       {/* Workspace Navigation Tabs */}
-      <div className="border-b border-slate-800 flex items-center gap-4 text-xs font-semibold">
+      <div className="border-b border-slate-800 flex items-center gap-4 text-xs font-semibold overflow-x-auto">
+        <Link
+          to="/dashboard"
+          className="pb-3 px-1 flex items-center gap-2 border-b-2 border-transparent text-amber-300 hover:text-amber-200 transition shrink-0"
+        >
+          <LayoutDashboard className="w-4 h-4 text-[#E5BB45]" />
+          <span>Executive Overview &rarr;</span>
+        </Link>
+
         <button
           type="button"
           onClick={() => setActiveTab('ingestion')}
-          className={`pb-3 px-1 flex items-center gap-2 border-b-2 transition cursor-pointer ${
+          className={`pb-3 px-1 flex items-center gap-2 border-b-2 transition cursor-pointer shrink-0 ${
             activeTab === 'ingestion'
               ? 'border-emerald-500 text-white'
               : 'border-transparent text-slate-400 hover:text-slate-200'
@@ -144,7 +191,7 @@ export const App: React.FC = () => {
         <button
           type="button"
           onClick={() => setActiveTab('reconciliation')}
-          className={`pb-3 px-1 flex items-center gap-2 border-b-2 transition cursor-pointer ${
+          className={`pb-3 px-1 flex items-center gap-2 border-b-2 transition cursor-pointer shrink-0 ${
             activeTab === 'reconciliation'
               ? 'border-emerald-500 text-white'
               : 'border-transparent text-slate-400 hover:text-slate-200'
@@ -157,7 +204,7 @@ export const App: React.FC = () => {
         <button
           type="button"
           onClick={() => setActiveTab('findings')}
-          className={`pb-3 px-1 flex items-center gap-2 border-b-2 transition cursor-pointer ${
+          className={`pb-3 px-1 flex items-center gap-2 border-b-2 transition cursor-pointer shrink-0 ${
             activeTab === 'findings'
               ? 'border-rose-500 text-white'
               : 'border-transparent text-slate-400 hover:text-slate-200'
@@ -170,7 +217,7 @@ export const App: React.FC = () => {
         <button
           type="button"
           onClick={() => setActiveTab('cash-flow')}
-          className={`pb-3 px-1 flex items-center gap-2 border-b-2 transition cursor-pointer ${
+          className={`pb-3 px-1 flex items-center gap-2 border-b-2 transition cursor-pointer shrink-0 ${
             activeTab === 'cash-flow'
               ? 'border-sky-500 text-white'
               : 'border-transparent text-slate-400 hover:text-slate-200'
@@ -183,7 +230,7 @@ export const App: React.FC = () => {
         <button
           type="button"
           onClick={() => setActiveTab('actions')}
-          className={`pb-3 px-1 flex items-center gap-2 border-b-2 transition cursor-pointer ${
+          className={`pb-3 px-1 flex items-center gap-2 border-b-2 transition cursor-pointer shrink-0 ${
             activeTab === 'actions'
               ? 'border-indigo-500 text-white'
               : 'border-transparent text-slate-400 hover:text-slate-200'
@@ -196,7 +243,7 @@ export const App: React.FC = () => {
         <button
           type="button"
           onClick={() => setActiveTab('telemetry')}
-          className={`pb-3 px-1 flex items-center gap-2 border-b-2 transition cursor-pointer ${
+          className={`pb-3 px-1 flex items-center gap-2 border-b-2 transition cursor-pointer shrink-0 ${
             activeTab === 'telemetry'
               ? 'border-emerald-500 text-white'
               : 'border-transparent text-slate-400 hover:text-slate-200'
@@ -248,21 +295,21 @@ export const App: React.FC = () => {
       {/* Tab 3: Financial Findings & Leakage Detection */}
       {activeTab === 'findings' && (
         <section>
-          <FindingsDashboard />
+          <FindingsDashboard inShell={false} />
         </section>
       )}
 
       {/* Tab 4: Cash Flow Forecasting & Scenario Planning */}
       {activeTab === 'cash-flow' && (
         <section>
-          <CashFlowDashboard />
+          <CashFlowDashboard inShell={false} />
         </section>
       )}
 
       {/* Tab 5: Business Action Center */}
       {activeTab === 'actions' && (
         <section>
-          <ActionCenterDashboard />
+          <ActionCenterDashboard inShell={false} />
         </section>
       )}
 

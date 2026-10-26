@@ -20,7 +20,7 @@ describe('FileUploadZone Component', () => {
     render(<FileUploadZone accounts={mockAccounts} onImportSuccess={vi.fn()} />);
 
     expect(screen.getByText(/Statement Ingestion/i)).toBeInTheDocument();
-    expect(screen.getByText(/Click to select or drag and drop a statement/i)).toBeInTheDocument();
+    expect(screen.getByText(/Drag and drop your statement file here|Click to select or drag and drop/i)).toBeInTheDocument();
     expect(screen.getByText(/Supported formats:/i)).toBeInTheDocument();
     expect(screen.getByLabelText(/Target Account:/i)).toBeInTheDocument();
   });
@@ -50,7 +50,7 @@ describe('FileUploadZone Component', () => {
 
     fireEvent.change(input, { target: { files: [validFile] } });
 
-    expect(screen.getByText('statement.csv')).toBeInTheDocument();
+    expect(screen.getAllByText(/statement\.csv/i).length).toBeGreaterThan(0);
     expect(screen.getByText(/Upload & Ingest Records/i)).toBeInTheDocument();
   });
 

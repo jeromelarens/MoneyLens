@@ -398,6 +398,22 @@ export const financialService = {
   },
 
   /**
+   * Updates an existing scenario.
+   */
+  updateScenario: async (
+    scenarioId: string,
+    request: import('@moneylens/shared').UpdateScenarioRequest,
+  ) => {
+    return apiRequest<import('@moneylens/shared').CashFlowScenario>(
+      `/cash-flow/scenarios/${scenarioId}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify(request),
+      },
+    );
+  },
+
+  /**
    * Phase 6: Business Action Center & Decision Intelligence
    */
 
